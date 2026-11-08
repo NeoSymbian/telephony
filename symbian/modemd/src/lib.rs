@@ -117,6 +117,13 @@ fn main() -> i32 {
         }
         images[i] = v;
     }
+    for (i, img) in images.iter().enumerate() {
+        // FNV-1a, to compare with the C0 backups on the Mac (the modem must get exactly these bytes)
+        let h = img.iter().fold(0x811c_9dc5u32, |h, &b| {
+            (h ^ b as u32).wrapping_mul(0x0100_0193)
+        });
+        dprintln!("[modemd] partition {} fnv1a {:#010x}", i, h);
+    }
     let (r, info) = hal_io(RMTFS_MEM, Io::default());
     if r < 0 {
         dprintln!("[modemd] rmtfs carve-out failed ({})", r);
@@ -128,6 +135,7 @@ fn main() -> i32 {
         info.len
     );
     let mut modem = Modem::new(images, info.b as u64);
+    modem.trace = true; // bring-up: every QRTR packet in the log
     let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
     if r < 0 {
         dprintln!("[modemd] modem boot failed to start ({})", r);

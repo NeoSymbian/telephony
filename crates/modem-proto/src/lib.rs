@@ -61,6 +61,8 @@ pub struct Server {
 }
 
 pub struct Modem {
+    /// Log every QRTR packet both ways (bring-up).
+    pub trace: bool,
     pub rmtfs: rmtfs::Rmtfs,
     pub servers: Vec<Server>,
     pub files: Vec<(String, Vec<u8>)>,
@@ -84,6 +86,7 @@ pub fn mask(id: &str) -> String {
 impl Modem {
     pub fn new(images: [Vec<u8>; 4], rmtfs_phys: u64) -> Self {
         Modem {
+            trace: false,
             rmtfs: rmtfs::Rmtfs::new(images, rmtfs_phys),
             servers: Vec::new(),
             files: Vec::new(),
@@ -114,6 +117,9 @@ impl Modem {
             dst_node: dst.0,
             dst_port: dst.1,
         };
+        if self.trace {
+            trace(p, ">", &h, payload);
+        }
         if let Err(e) = p.send(&qrtr::encode(&h, payload)) {
             p.log(format_args!(
                 "qrtr: send type {ty} to {}:{} failed ({e})",
@@ -164,6 +170,9 @@ impl Modem {
             ));
             return;
         };
+        if self.trace {
+            trace(p, "<", &h, payload);
+        }
         if h.dst_node != NODE && h.dst_node != NODE_BCAST {
             return;
         }
@@ -333,6 +342,37 @@ impl Modem {
     }
 }
 
+/// One line per packet: direction, type, src -> dst, size, and the QMI header or control words.
+fn trace(p: &mut dyn Platform, dir: &str, h: &Header, payload: &[u8]) {
+    let (src, dst) = (h.src_port as i32, h.dst_port as i32);
+    if h.ty != qrtr::TYPE_DATA {
+        let w = qrtr::ctrl_words(payload).map(|c| c.1).unwrap_or_default();
+        p.log(format_args!(
+            "{dir} ctrl {} {}:{src} -> {}:{dst} {w:?}",
+            h.ty, h.src_node, h.dst_node
+        ));
+        return;
+    }
+    let confirm = if h.confirm_rx != 0 { " confirm" } else { "" };
+    match qmi::Msg::parse(payload) {
+        Some(m) => p.log(format_args!(
+            "{dir} data {}:{src} -> {}:{dst} {} B qmi type {} id {:#x} txn {}{confirm}",
+            h.src_node,
+            h.dst_node,
+            payload.len(),
+            m.ty,
+            m.id,
+            m.txn
+        )),
+        None => p.log(format_args!(
+            "{dir} data {}:{src} -> {}:{dst} {} B{confirm}",
+            h.src_node,
+            h.dst_node,
+            payload.len()
+        )),
+    }
+}
+
 fn tftp_name(b: &[u8]) -> &str {
     b.get(2..)
         .and_then(|s| s.split(|&c| c == 0).next())
@@ -436,7 +476,7 @@ mod tests {
         m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 17, RMTFS_PORT, &alloc));
         assert_eq!(reply(&f).tlv(0x10), Some(&0xfc20_1000u64.to_le_bytes()[..]));
         let mut iov = alloc::vec![1u8];
-        for w in [1u32, 0x200, 1] {
+        for w in [1u32, 0xfc20_1200, 1] {
             iov.extend_from_slice(&w.to_le_bytes());
         }
         let read = qmi::Builder::new(qmi::REQUEST, 3, 3)
@@ -466,7 +506,7 @@ mod tests {
         let (mut m, mut f) = (modem(), fake());
         f.mem[0..512].fill(9);
         let mut iov = alloc::vec![1u8];
-        for w in [3u32, 0, 1] {
+        for w in [3u32, 0xfc20_1000, 1] {
             iov.extend_from_slice(&w.to_le_bytes());
         }
         let w = qmi::Builder::new(qmi::REQUEST, 4, 3)

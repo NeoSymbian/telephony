@@ -41,11 +41,13 @@ pub fn handle(m: &Msg) -> Vec<u8> {
                 list.extend_from_slice(&0u32.to_le_bytes());
                 list[0] += 1;
             }
-            r.result(0)
-                .u16(0x10, found.len() as u16)
-                .u16(0x11, 1)
-                .tlv(0x12, &list)
-                .finish()
+            let r = r.result(0).u16(0x10, found.len() as u16).u16(0x11, 1);
+            // Linux sends the list only when the service is known (domain_list_valid)
+            if found.is_empty() {
+                r.finish()
+            } else {
+                r.tlv(0x12, &list).finish()
+            }
         }
         PFR => r.result(0).finish(),
         _ => r.result(2).finish(),
@@ -81,5 +83,7 @@ mod tests {
             .tlv(0x10)
             .map(|t| t.to_vec());
         assert_eq!(m, Some(alloc::vec![0, 0]));
+        let r = handle(&Msg::parse(&q).unwrap());
+        assert_eq!(Msg::parse(&r).unwrap().tlv(0x12), None);
     }
 }

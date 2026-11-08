@@ -59,7 +59,11 @@ impl Rmtfs {
                         p.log(format_args!("rmtfs: open {} -> {}", PATHS[i], i));
                         r.result(0).u32(0x10, i as u32).finish()
                     }
-                    None => r.result(ERR_INTERNAL).finish(),
+                    None => {
+                        let shown = core::str::from_utf8(path).unwrap_or("?");
+                        p.log(format_args!("rmtfs: open {shown:?} refused"));
+                        r.result(ERR_INTERNAL).finish()
+                    }
                 }
             }
             CLOSE | GET_DEV_ERROR => {
@@ -89,15 +93,28 @@ impl Rmtfs {
         let caller = m.u32(1).ok_or(ERR_MALFORMED)? as usize;
         let write = m.u8(2).ok_or(ERR_MALFORMED)? != 0;
         let list = m.tlv(3).ok_or(ERR_MALFORMED)?;
+        let base = self.phys;
         let image = self.images.get_mut(caller).ok_or(ERR_INTERNAL)?;
         let n = *list.first().ok_or(ERR_MALFORMED)? as usize; // a u8 count, then {sector, offset, count} entries
         for e in list.get(1..1 + 12 * n).ok_or(ERR_MALFORMED)?.chunks(12) {
             let w = |i: usize| u32::from_le_bytes(e[i..i + 4].try_into().unwrap()) as usize;
-            let (start, offset, len) = (w(0) * SECTOR, w(4), w(8) * SECTOR);
+            // "phys_offset" is the buffer's physical address (C1: 0xfc201200 = base + 0x200), not an offset
+            let (start, addr, len) = (w(0) * SECTOR, w(4) as u64, w(8) * SECTOR);
+            let offset = match addr.checked_sub(base) {
+                Some(o) if o + len as u64 <= 0x20_0000 => o as u32,
+                _ => {
+                    p.log(format_args!(
+                        "rmtfs: iovec address {addr:#x} outside the buffer"
+                    ));
+                    return Err(ERR_INTERNAL);
+                }
+            };
             if write {
                 let mut buf = alloc::vec![0u8; len];
-                p.rmtfs_read(offset as u32, &mut buf)
-                    .map_err(|_| ERR_INTERNAL)?;
+                if let Err(e) = p.rmtfs_read(offset, &mut buf) {
+                    p.log(format_args!("rmtfs: buffer read +{offset:#x} failed ({e})"));
+                    return Err(ERR_INTERNAL);
+                }
                 if start + len > image.len() {
                     image.resize(start + len, 0);
                 }
@@ -109,8 +126,12 @@ impl Rmtfs {
                     let end = image.len().min(start + len);
                     buf[..end - start].copy_from_slice(&image[start..end]);
                 }
-                p.rmtfs_write(offset as u32, &buf)
-                    .map_err(|_| ERR_INTERNAL)?;
+                if let Err(e) = p.rmtfs_write(offset, &buf) {
+                    p.log(format_args!(
+                        "rmtfs: buffer write +{offset:#x} failed ({e})"
+                    ));
+                    return Err(ERR_INTERNAL);
+                }
                 self.reads += 1;
             }
             p.log(format_args!(
