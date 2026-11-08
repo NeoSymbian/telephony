@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# apply the sargo UCM VoiceCall path by hand (alsaucm did not keep it): boot sequences, the verb, Speakers, Microphone
+U=/usr/share/alsa/ucm2/Google/sargo
+pick() {  # $1 = start regex, $2 = end regex, $3 = file: print "name|value" of the cset lines in that block
+	awk -v s="$1" -v e="$2" '$0 ~ s {on=1} on && $0 ~ e {on=0} on && /cset "name=/ {
+		l=$0; sub(/.*cset "name=\047/, "", l); n=l; sub(/\047.*/, "", n); v=l; sub(/^[^\047]*\047 /, "", v); sub(/"[[:space:]]*$/, "", v); print n "|" v }' "$3"
+}
+{ pick '^BootSequence' '^\]' $U/sargo.conf; pick '^FixedBootSequence' '^\]' $U/sargo.conf
+  pick '^SectionVerb' 'DisableSequence' $U/VoiceCall.conf
+  pick 'SectionDevice."Speakers"' 'DisableSequence' $U/VoiceCall.conf
+  pick 'SectionDevice."Microphone"' 'DisableSequence' $U/VoiceCall.conf; } | while IFS='|' read -r n v; do
+	amixer -c 0 -q cset name="$n" "$v" || echo "FAILED: $n = $v"
+done
+echo routed

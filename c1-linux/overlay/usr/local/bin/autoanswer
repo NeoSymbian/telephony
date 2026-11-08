@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# C1 test helper: answer every incoming call and log each call's state changes
+while true; do
+	for c in $(mmcli -m 0 --voice-list-calls 2>/dev/null | grep -o "/org/freedesktop/ModemManager1/Call/[0-9]*"); do
+		info=$(mmcli -o "$c" 2>/dev/null)
+		st=$(echo "$info" | grep -E "^ *\| *state:" | head -1 | sed "s/.*state: //")
+		dir=$(echo "$info" | grep -E "direction:" | sed "s/.*direction: //")
+		key="$dir $st"
+		if [ "$key" != "$(cat /tmp/last.${c##*/} 2>/dev/null)" ]; then
+			echo "$(date +%T) $c $key"
+			echo "$key" > /tmp/last.${c##*/}
+		fi
+		if [ "$dir" = incoming ] && [ "$st" = ringing-in ]; then
+			mmcli -o "$c" --accept
+		fi
+	done
+	sleep 1
+done

@@ -1,0 +1,6 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# quick status: remote processors, QRTR services, modem in ModemManager
+for r in /sys/class/remoteproc/*; do echo "$(cat $r/name) $(cat $r/state) $(cat $r/firmware)"; done
+qrtr-lookup 2>/dev/null | head -40
+mmcli -L 2>&1; mmcli -m any 2>&1 | head -60
