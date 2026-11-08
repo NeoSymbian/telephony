@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "modemd"
+description = "MODEMD.EXE: the apps side of the Pixel's modem (QRTR router, rmtfs, service locator, TFTP)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+test = false
+
+[dependencies]
+e32.workspace = true
+modem-proto.workspace = true

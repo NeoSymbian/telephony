@@ -1,0 +1,2 @@
+# NAME.EXE uid3 staticlib (build/emitter/build_rust_exe.py; copy the line and the .a into build/rust/)
+MODEMD.EXE     0xE0003001  libmodemd.a

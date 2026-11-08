@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+# The Symbian side: MODEMD.EXE as a staticlib for build/emitter/build_rust_exe.py (exes.txt). Its own workspace:
+# built only for armv5te-none-eabi with the pinned nightly (`cargo arm`), like neoui/symbian.
+[workspace]
+members = ["modemd"]
+resolver = "2"
+
+[workspace.dependencies]
+# NeoSymbian/e32-rs, the same revision as neoui
+e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "e97e2ebcb242f5365d1b3f9d520646603e1e9056", features = ["critical-section"] }
+modem-proto = { path = "../crates/modem-proto" }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+codegen-units = 1
+lto = true
+
+[profile.dev]
+panic = "abort"

@@ -1,0 +1,7 @@
+# The Symbian user side is built -march=armv5te, ARM/Thumb, soft-float ABI (NeoSymbian/build toolchain/symcc).
+# Never use an eabihf target: it passes floats in VFP registers and breaks calls into Symbian libraries.
+#
+#   cargo arm    the Symbian staticlibs: target/armv5te-none-eabi/release/lib*.a (core built from source: tier 3)
+#   cargo test   host unit tests of the pure parts (e32-sys, e32)
+[alias]
+arm = "build --release --target armv5te-none-eabi -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem"
