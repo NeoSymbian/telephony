@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-//! MODEMD.EXE (docs/telephony.md C4): reads the modem's EFS partitions, boots the modem, and runs the apps side of
-//! QRTR (modem_proto::Modem) over the kernel's telephony HAL functions (kernel qcom_telhal.cpp, 0x4e0d..0x4e12).
-//! Started by hand for now (Terminal: `modemd`); auto-start at boot is decided in C5.
+//! MODEMD.EXE (docs/telephony.md C4, C5): reads the modem's EFS partitions, boots the modem, runs the apps side of
+//! QRTR (modem_proto::Modem) over the kernel's telephony HAL functions (kernel qcom_telhal.cpp, 0x4e0d..0x4e12), and
+//! serves the NeoModem IPC API (modem_ipc: status, dial, answer, hang up). neoui's SYSSTART starts it at boot; a
+//! second copy (Terminal `modemd`) finds the server name taken and exits.
+//! The server answers all the time: the partition reads and the boot wait are steps of the loop, never a long block.
 #![no_std]
 
 extern crate alloc;
@@ -9,7 +11,14 @@ extern crate alloc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
+use core::ops::ControlFlow;
+use core::pin::pin;
+use e32::rt::{self, Either};
+use e32::server::{self, Message, Server, Service};
+use e32::sys::err;
+use e32::sys::ipc::TVersion;
 use e32::{dprintln, time};
+use modem_proto::modem_ipc::{self, Status, op};
 use modem_proto::{Modem, Platform};
 
 const GROUP_VARIANT: i32 = 1;
@@ -24,6 +33,8 @@ const NOT_READY: i32 = -18;
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
 const RUNNING: u32 = 8;
 const FATAL: u32 = 1;
+const BOOT_TIMEOUT_MS: u64 = 60_000;
+const STATUS_LOG_MS: u64 = 30_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -97,79 +108,120 @@ impl Platform for Hal {
     }
 }
 
-fn main() -> i32 {
-    dprintln!("[modemd] start: reading the EFS partitions");
-    let mut images: [Vec<u8>; 4] = Default::default();
-    for (i, &n) in PART_SIZES.iter().enumerate() {
-        let mut v = vec![0u8; n];
-        let (r, _) = hal_io(
-            PART_READ,
-            Io {
-                a: i as u32,
-                b: 0,
-                len: n as u32,
-                buf: v.as_mut_ptr() as u32,
-            },
-        );
+enum Phase {
+    /// reading partition i (one per loop step)
+    Read(usize),
+    /// the kernel boots the modem; since t0
+    Wait(u64),
+    Running,
+    Failed,
+}
+
+struct Daemon {
+    phase: Phase,
+    images: [Vec<u8>; 4],
+    modem: Option<Modem>,
+    /// the QRTR receive buffer (8 KB: not on the 8 KB stack)
+    rx: Vec<u8>,
+    /// before the modem exists (booting / failed)
+    status: Status,
+    t0: u64,
+    last_log: u64,
+    fatal_seen: bool,
+}
+
+impl Daemon {
+    fn status(&self) -> Status {
+        self.modem.as_ref().map_or(self.status, |m| m.status)
+    }
+
+    fn fail(&mut self, what: &str, r: i32) {
+        dprintln!("[modemd] {} failed ({})", what, r);
+        self.phase = Phase::Failed;
+        self.status.modem = modem_ipc::modem::FAILED;
+        if let Some(m) = &mut self.modem {
+            m.status.modem = modem_ipc::modem::FAILED;
+        }
+    }
+
+    /// One step of the work: Err(KErrNotSupported) when this machine has no modem (QEMU/Syborg).
+    fn step(&mut self) -> Result<(), i32> {
+        match self.phase {
+            Phase::Read(i) => {
+                let n = PART_SIZES[i];
+                let mut v = vec![0u8; n];
+                let (r, _) = hal_io(
+                    PART_READ,
+                    Io {
+                        a: i as u32,
+                        b: 0,
+                        len: n as u32,
+                        buf: v.as_mut_ptr() as u32,
+                    },
+                );
+                if r == err::KERR_NOT_SUPPORTED {
+                    return Err(r);
+                }
+                if r < 0 {
+                    self.fail("partition read", r);
+                    return Ok(());
+                }
+                self.images[i] = v;
+                if i + 1 < PART_SIZES.len() {
+                    self.phase = Phase::Read(i + 1);
+                } else {
+                    self.boot();
+                }
+            }
+            Phase::Wait(t0) => {
+                let s = state();
+                if s[1] != 0 {
+                    self.fail("modem boot", s[1] as i32);
+                } else if s[0] == RUNNING && s[3] != 0 {
+                    let now = time::millis();
+                    dprintln!("[modemd] modem running after {} ms; QRTR up", now - t0);
+                    self.t0 = now;
+                    self.last_log = now;
+                    if let Some(m) = &mut self.modem {
+                        m.start(&mut Hal);
+                    }
+                    self.phase = Phase::Running;
+                } else if time::millis() - t0 > BOOT_TIMEOUT_MS {
+                    self.fail("modem boot (60 s)", NOT_READY);
+                }
+            }
+            Phase::Running => self.run(),
+            Phase::Failed => {}
+        }
+        Ok(())
+    }
+
+    fn boot(&mut self) {
+        let (r, info) = hal_io(RMTFS_MEM, Io::default());
         if r < 0 {
-            dprintln!("[modemd] partition {} read failed ({})", i, r);
-            return r;
+            self.fail("rmtfs carve-out", r);
+            return;
         }
-        images[i] = v;
-    }
-    for (i, img) in images.iter().enumerate() {
-        // FNV-1a, to compare with the C0 backups on the Mac (the modem must get exactly these bytes)
-        let h = img.iter().fold(0x811c_9dc5u32, |h, &b| {
-            (h ^ b as u32).wrapping_mul(0x0100_0193)
-        });
-        dprintln!("[modemd] partition {} fnv1a {:#010x}", i, h);
-    }
-    let (r, info) = hal_io(RMTFS_MEM, Io::default());
-    if r < 0 {
-        dprintln!("[modemd] rmtfs carve-out failed ({})", r);
-        return r;
-    }
-    dprintln!(
-        "[modemd] rmtfs buffer {:#x} + {:#x}; booting the modem",
-        info.b,
-        info.len
-    );
-    let mut modem = Modem::new(images, info.b as u64);
-    modem.trace = true; // bring-up: every QRTR packet in the log
-    let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
-    if r < 0 {
-        dprintln!("[modemd] modem boot failed to start ({})", r);
-        return r;
-    }
-    let t0 = time::millis();
-    loop {
-        let s = state();
-        if s[1] != 0 {
-            dprintln!(
-                "[modemd] modem boot failed at step {} ({})",
-                s[0],
-                s[1] as i32
-            );
-            return s[1] as i32;
+        dprintln!(
+            "[modemd] rmtfs buffer {:#x} + {:#x}; booting the modem",
+            info.b,
+            info.len
+        );
+        let images = core::mem::take(&mut self.images);
+        self.modem = Some(Modem::new(images, info.b as u64));
+        let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
+        if r < 0 {
+            self.fail("modem boot start", r);
+            return;
         }
-        if s[0] == RUNNING && s[3] != 0 {
-            break;
-        }
-        if time::millis() - t0 > 60_000 {
-            dprintln!("[modemd] modem not up after 60 s (step {})", s[0]);
-            return NOT_READY;
-        }
-        time::sleep(50_000);
+        self.phase = Phase::Wait(time::millis());
     }
-    dprintln!(
-        "[modemd] modem running after {} ms; QRTR up",
-        time::millis() - t0
-    );
-    modem.start(&mut Hal);
-    let mut buf = vec![0u8; 0x2000];
-    let mut last = time::millis();
-    let mut fatal = false;
-    loop {
+
+    fn run(&mut self) {
+        let Some(modem) = &mut self.modem else {
+            return;
+        };
+        let buf = &mut self.rx;
         loop {
             let r = hal(RECV, buf.as_mut_ptr(), buf.len() as *mut u8);
             if r == NOT_READY {
@@ -182,24 +234,109 @@ fn main() -> i32 {
             modem.handle(&mut Hal, &buf[..r as usize]);
         }
         let now = time::millis();
-        if now - last >= 30_000 {
-            last = now;
+        modem.tick(&mut Hal, now);
+        if now - self.last_log >= STATUS_LOG_MS {
+            self.last_log = now;
             let s = state();
+            let st = modem.status;
             dprintln!(
-                "[modemd] {} s: slave-kernel {:#x}, rmtfs {} reads {} writes, {} modem servers",
-                (now - t0) / 1000,
+                "[modemd] {} s: slave-kernel {:#x}, reg {} rat {} bars {}, call state {}",
+                (now - self.t0) / 1000,
                 s[2],
-                modem.rmtfs.reads,
-                modem.rmtfs.writes,
-                modem.servers.len()
+                st.reg,
+                st.rat,
+                st.bars,
+                st.call.state
             );
-            if s[2] & FATAL != 0 && !fatal {
-                fatal = true;
+            if s[2] & FATAL != 0 && !self.fatal_seen {
+                self.fatal_seen = true;
                 dprintln!("[modemd] the modem raised FATAL");
+                modem.status.modem = modem_ipc::modem::FAILED;
             }
         }
-        time::sleep(2000);
     }
+}
+
+impl Service for Daemon {
+    type Session = ();
+
+    fn connect(&mut self, v: TVersion) -> Result<(), i32> {
+        if v.major as i8 == modem_ipc::VERSION.0 {
+            Ok(())
+        } else {
+            Err(err::KERR_NOT_SUPPORTED)
+        }
+    }
+
+    fn message(&mut self, _: &mut (), msg: Message) {
+        let r = match msg.function() {
+            op::STATUS => msg
+                .write8(0, &self.status().to_bytes(), 0)
+                .map_or_else(|e| e, |_| err::KERR_NONE),
+            op::DIAL => match (&mut self.modem, msg.read8_vec(0)) {
+                (Some(m), Ok(n)) => match core::str::from_utf8(&n) {
+                    Ok(n) => m.dial(&mut Hal, n).err().unwrap_or(err::KERR_NONE),
+                    Err(_) => err::KERR_ARGUMENT,
+                },
+                (_, Err(e)) => e,
+                (None, _) => NOT_READY,
+            },
+            op::ANSWER => self.modem.as_mut().map_or(NOT_READY, |m| {
+                m.answer(&mut Hal).err().unwrap_or(err::KERR_NONE)
+            }),
+            op::HANGUP => self.modem.as_mut().map_or(NOT_READY, |m| {
+                m.hangup(&mut Hal).err().unwrap_or(err::KERR_NONE)
+            }),
+            _ => err::KERR_NOT_SUPPORTED,
+        };
+        msg.complete(r);
+    }
+
+    fn disconnect(&mut self, _: ()) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
+}
+
+fn main() -> i32 {
+    let server = match Server::create(modem_ipc::NAME) {
+        Ok(s) => s,
+        Err(e) => {
+            dprintln!("[modemd] already running ({}): exiting", e);
+            return 0;
+        }
+    };
+    dprintln!("[modemd] start: serving NeoModem, reading the EFS partitions");
+    let mut d = Daemon {
+        phase: Phase::Read(0),
+        images: Default::default(),
+        modem: None,
+        rx: vec![0u8; 0x2000],
+        status: Status::default(),
+        t0: 0,
+        last_log: 0,
+        fatal_seen: false,
+    };
+    rt::block_on(async {
+        let mut receive = pin!(server.receive());
+        loop {
+            match rt::select(receive.as_mut(), time::delay(2000)).await {
+                Either::Left(Ok(msg)) => {
+                    receive.set(server.receive());
+                    let _ = server::dispatch(&mut d, msg);
+                }
+                Either::Left(Err(e)) => {
+                    dprintln!("[modemd] receive failed ({})", e);
+                    receive.set(server.receive());
+                }
+                Either::Right(()) => {
+                    if let Err(e) = d.step() {
+                        dprintln!("[modemd] no modem on this machine ({}): exiting", e);
+                        return e;
+                    }
+                }
+            }
+        }
+    })
 }
 
 e32::main!(main);

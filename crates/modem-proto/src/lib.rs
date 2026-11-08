@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The apps side of the Pixel 3a XL's modem (docs/telephony.md C4): a QRTR router for node 1 with the services the
-//! modem needs from it (rmtfs, the service locator, TFTP) and a small QMI client. Pure logic over a [`Platform`]
-//! (the kernel's HAL on the phone, a fake in tests), so it is unit-tested on the host.
+//! The apps side of the Pixel 3a XL's modem (docs/telephony.md C4, C5): a QRTR router for node 1 with the services
+//! the modem needs from it (rmtfs, the service locator, TFTP) and QMI clients for DMS, UIM, NAS and VOICE that keep
+//! a [`modem_ipc::Status`] and place, answer and end calls. Pure logic over a [`Platform`] (the kernel's HAL on the
+//! phone, a fake in tests), so it is unit-tested on the host.
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 pub mod locator;
+pub mod nas;
 pub mod qmi;
 pub mod qrtr;
 pub mod rmtfs;
 pub mod tftp;
+pub mod voice;
+
+pub use modem_ipc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
+use modem_ipc::{Call, Status, Text, call};
 use qrtr::{Header, NODE_BCAST, PORT_CTRL};
 
 /// What the router needs from the system.
@@ -32,7 +38,6 @@ const MODEM_NODE: u32 = 0;
 const RMTFS_PORT: u32 = 0x10;
 const LOCATOR_PORT: u32 = 0x11;
 const TFTP_PORT: u32 = 0x12;
-const CLIENT_PORT: u32 = 0x20;
 const FIRST_TRANSFER_PORT: u32 = 0x100;
 /// (service, version, instance, our port)
 const SERVICES: [(u32, u32, u32, u32); 3] = [
@@ -47,9 +52,19 @@ const SERVICES: [(u32, u32, u32, u32); 3] = [
 ];
 const DMS: u32 = 2;
 const UIM: u32 = 11;
+const NAS: u32 = nas::SERVICE;
+const VOICE: u32 = voice::SERVICE;
+/// Our QMI clients: (service, our port)
+const CLIENTS: [(u32, u32); 4] = [(DMS, 0x20), (UIM, 0x21), (NAS, 0x22), (VOICE, 0x23)];
 const DMS_GET_REVISION: u16 = 0x23;
 const DMS_GET_IDS: u16 = 0x25;
+const DMS_SET_OPERATING_MODE: u16 = 0x2e;
 const UIM_GET_CARD_STATUS: u16 = 0x2f;
+/// NAS polls, as ModemManager does (indications cover the rest)
+const POLL_MS: u64 = 30_000;
+pub const KERR_NOT_READY: i32 = -18;
+pub const KERR_ARGUMENT: i32 = -6;
+pub const KERR_IN_USE: i32 = -14;
 
 /// A server the modem announced: service, version|instance word, node, port.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +73,15 @@ pub struct Server {
     pub instance: u32,
     pub node: u32,
     pub port: u32,
+}
+
+/// One QMI client: its server, our port, the transaction counter and the requests still unanswered (txn, id).
+struct Client {
+    service: u32,
+    dst: (u32, u32),
+    port: u32,
+    txn: u16,
+    pending: Vec<(u16, u16)>,
 }
 
 pub struct Modem {
@@ -70,10 +94,16 @@ pub struct Modem {
     pub imei: Option<String>,
     /// The first card's state from UIM: 0 absent, 1 present, 2 error.
     pub card: Option<u8>,
+    /// What NeoModem clients see (modem_ipc::op::STATUS)
+    pub status: Status,
     transfers: Vec<tftp::Transfer>,
     next_port: u32,
-    txn: u16,
+    clients: Vec<Client>,
     hello_seen: bool,
+    online_sent: bool,
+    plmn_asked: Option<(u16, u16)>,
+    hangup_pending: bool,
+    last_poll: u64,
 }
 
 /// "350000000000012" -> "35xxxxxxxxxxx12": never log a whole IMEI.
@@ -93,10 +123,15 @@ impl Modem {
             revision: None,
             imei: None,
             card: None,
+            status: Status::default(),
             transfers: Vec::new(),
             next_port: FIRST_TRANSFER_PORT,
-            txn: 0,
+            clients: Vec::new(),
             hello_seen: false,
+            online_sent: false,
+            plmn_asked: None,
+            hangup_pending: false,
+            last_poll: 0,
         }
     }
 
@@ -145,20 +180,140 @@ impl Modem {
 
     /// Say HELLO to the modem's router and announce our services.
     pub fn start(&mut self, p: &mut dyn Platform) {
+        self.status.modem = modem_ipc::modem::RUNNING;
         self.ctrl(p, qrtr::TYPE_HELLO, (MODEM_NODE, PORT_CTRL), [0; 4]);
         self.announce(p, (MODEM_NODE, PORT_CTRL));
     }
 
-    fn query(&mut self, p: &mut dyn Platform, server: Server, id: u16) {
-        self.txn = self.txn.wrapping_add(1);
-        let req = qmi::Builder::new(qmi::REQUEST, self.txn, id).finish();
-        self.send(
-            p,
-            qrtr::TYPE_DATA,
-            CLIENT_PORT,
-            (server.node, server.port),
-            &req,
-        );
+    /// One QMI request from our client of `service`; false if the modem hasn't announced that service.
+    fn request(
+        &mut self,
+        p: &mut dyn Platform,
+        service: u32,
+        id: u16,
+        tlvs: &[(u8, &[u8])],
+    ) -> bool {
+        let Some(c) = self.clients.iter_mut().find(|c| c.service == service) else {
+            return false;
+        };
+        c.txn = c.txn.wrapping_add(1).max(1);
+        let mut b = qmi::Builder::new(qmi::REQUEST, c.txn, id);
+        for (t, v) in tlvs {
+            b = b.tlv(*t, v);
+        }
+        if c.pending.len() >= 16 {
+            c.pending.remove(0); // never answered: forget the oldest
+        }
+        c.pending.push((c.txn, id));
+        let (port, dst) = (c.port, c.dst);
+        self.send(p, qrtr::TYPE_DATA, port, dst, &b.finish());
+        true
+    }
+
+    /// The first requests once the modem announces a service we are a client of.
+    fn client_up(&mut self, p: &mut dyn Platform, s: Server) {
+        let Some(&(_, port)) = CLIENTS.iter().find(|c| c.0 == s.service) else {
+            return;
+        };
+        let dst = (s.node, s.port);
+        match self.clients.iter_mut().find(|c| c.service == s.service) {
+            Some(c) => c.dst = dst,
+            None => self.clients.push(Client {
+                service: s.service,
+                dst,
+                port,
+                txn: 0,
+                pending: Vec::new(),
+            }),
+        }
+        match s.service {
+            DMS => {
+                self.request(p, DMS, DMS_GET_REVISION, &[]);
+                self.request(p, DMS, DMS_GET_IDS, &[]);
+                self.maybe_online(p);
+            }
+            UIM => {
+                self.request(p, UIM, UIM_GET_CARD_STATUS, &[]);
+            }
+            NAS => {
+                self.request(p, NAS, nas::REGISTER_INDICATIONS, &nas::INDICATIONS);
+                self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
+                self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
+            }
+            _ => {
+                self.request(p, VOICE, voice::INDICATION_REGISTER, &voice::INDICATIONS);
+            }
+        }
+    }
+
+    /// The radio on (DMS Set Operating Mode online) once there is a SIM: ModemManager does the same on enable.
+    fn maybe_online(&mut self, p: &mut dyn Platform) {
+        if !self.online_sent
+            && self.status.sim == modem_ipc::sim::PRESENT
+            && self.request(p, DMS, DMS_SET_OPERATING_MODE, &[(0x01, &[0])])
+        {
+            self.online_sent = true;
+        }
+    }
+
+    /// The periodic work: NAS serving system and signal every 30 s. `now_ms` is any monotonic clock.
+    pub fn tick(&mut self, p: &mut dyn Platform, now_ms: u64) {
+        if now_ms.saturating_sub(self.last_poll) < POLL_MS {
+            return;
+        }
+        self.last_poll = now_ms;
+        self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
+        self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
+    }
+
+    /// Place a call (modem_ipc::op::DIAL). KErrArgument for a number [`voice::dialable`] refuses, KErrInUse while a
+    /// call is up, KErrNotReady before VOICE is there.
+    pub fn dial(&mut self, p: &mut dyn Platform, number: &str) -> Result<(), i32> {
+        if !voice::dialable(number) {
+            return Err(KERR_ARGUMENT);
+        }
+        if !matches!(self.status.call.state, call::NONE | call::END) {
+            return Err(KERR_IN_USE);
+        }
+        if !self.request(p, VOICE, voice::DIAL, &[(0x01, number.as_bytes())]) {
+            return Err(KERR_NOT_READY);
+        }
+        self.hangup_pending = false;
+        self.status.call = Call {
+            id: 0,
+            state: call::ORIGINATION,
+            incoming: false,
+            number: Text::new(number),
+        };
+        p.log(format_args!("voice: dial {}", mask(number)));
+        Ok(())
+    }
+
+    /// Answer the incoming call (modem_ipc::op::ANSWER); the modem refuses it before "incoming" (C1: during setup).
+    pub fn answer(&mut self, p: &mut dyn Platform) -> Result<(), i32> {
+        let c = self.status.call;
+        if !(c.incoming && matches!(c.state, call::INCOMING | call::WAITING)) {
+            return Err(KERR_NOT_READY);
+        }
+        self.request(p, VOICE, voice::ANSWER, &[(0x01, &[c.id])])
+            .then_some(())
+            .ok_or(KERR_NOT_READY)
+    }
+
+    /// End, reject or cancel the call (modem_ipc::op::HANGUP). A dial the modem hasn't numbered yet ends as soon as
+    /// it has its id.
+    pub fn hangup(&mut self, p: &mut dyn Platform) -> Result<(), i32> {
+        let c = self.status.call;
+        if matches!(c.state, call::NONE | call::END) {
+            return Err(KERR_NOT_READY);
+        }
+        if c.id == 0 {
+            self.hangup_pending = true;
+            return Ok(());
+        }
+        self.request(p, VOICE, voice::END, &[(0x01, &[c.id])])
+            .then_some(())
+            .ok_or(KERR_NOT_READY)
     }
 
     /// One QRTR packet from the modem.
@@ -215,12 +370,7 @@ impl Modem {
                     instance & 0xff,
                     instance >> 8
                 ));
-                if service == DMS {
-                    self.query(p, s, DMS_GET_REVISION);
-                    self.query(p, s, DMS_GET_IDS);
-                } else if service == UIM {
-                    self.query(p, s, UIM_GET_CARD_STATUS);
-                }
+                self.client_up(p, s);
             }
             qrtr::TYPE_NEW_LOOKUP => {
                 // the remote looks up our services: matching NEW_SERVERs, then an empty one ends the list
@@ -280,7 +430,7 @@ impl Modem {
                 }
                 tftp::Action::Ignore => {}
             },
-            CLIENT_PORT => self.client(p, payload),
+            port if self.clients.iter().any(|c| c.port == port) => self.client(p, port, payload),
             port => {
                 let Some(i) = self.transfers.iter().position(|t| t.port == port) else {
                     return;
@@ -303,41 +453,167 @@ impl Modem {
         }
     }
 
-    fn client(&mut self, p: &mut dyn Platform, payload: &[u8]) {
+    fn client(&mut self, p: &mut dyn Platform, port: u32, payload: &[u8]) {
         let Some(m) = qmi::Msg::parse(payload) else {
             return;
         };
-        if m.ty != qmi::RESPONSE {
+        let Some(c) = self.clients.iter_mut().find(|c| c.port == port) else {
             return;
+        };
+        let service = c.service;
+        match m.ty {
+            qmi::RESPONSE => {
+                let Some(k) = c.pending.iter().position(|&r| r == (m.txn, m.id)) else {
+                    p.log(format_args!(
+                        "qmi: service {service} response {:#x} txn {} not ours",
+                        m.id, m.txn
+                    ));
+                    return;
+                };
+                c.pending.remove(k);
+                self.response(p, service, &m);
+            }
+            qmi::INDICATION => self.indication(p, service, &m),
+            _ => {}
         }
+    }
+
+    fn response(&mut self, p: &mut dyn Platform, service: u32, m: &qmi::Msg) {
         let text = |t: Option<&[u8]>| t.map(|b| String::from_utf8_lossy(b).into_owned());
-        match (m.id, m.result()) {
-            (DMS_GET_REVISION, Some(Ok(()))) => {
+        let Some(Ok(())) = m.result() else {
+            p.log(format_args!(
+                "qmi: service {service} request {:#x} failed {:?}",
+                m.id,
+                m.result()
+            ));
+            if (service, m.id) == (VOICE, voice::DIAL) {
+                self.status.call.state = call::END;
+            }
+            return;
+        };
+        match (service, m.id) {
+            (DMS, DMS_GET_REVISION) => {
                 self.revision = text(m.tlv(0x01));
                 p.log(format_args!(
                     "dms: revision {}",
                     self.revision.as_deref().unwrap_or("?")
                 ));
             }
-            (DMS_GET_IDS, Some(Ok(()))) => {
+            (DMS, DMS_GET_IDS) => {
                 self.imei = text(m.tlv(0x11));
                 p.log(format_args!(
                     "dms: IMEI {}",
                     self.imei.as_deref().map(mask).unwrap_or_default()
                 ));
             }
-            (UIM_GET_CARD_STATUS, Some(Ok(()))) => {
+            (DMS, DMS_SET_OPERATING_MODE) => {
+                self.status.modem = modem_ipc::modem::ONLINE;
+                p.log(format_args!("dms: online"));
+            }
+            (UIM, UIM_GET_CARD_STATUS) => {
                 // card status: 4 x u16 session indexes, a u8 card count, then per card its state first
                 self.card = m.tlv(0x10).and_then(|t| t.get(9)).copied();
-                let state = match self.card {
-                    Some(0) => "absent",
-                    Some(1) => "present",
-                    Some(2) => "error",
-                    _ => "?",
+                let (sim, state) = match self.card {
+                    Some(0) => (modem_ipc::sim::ABSENT, "absent"),
+                    Some(1) => (modem_ipc::sim::PRESENT, "present"),
+                    Some(2) => (modem_ipc::sim::ERROR, "error"),
+                    _ => (modem_ipc::sim::UNKNOWN, "?"),
                 };
+                self.status.sim = sim;
                 p.log(format_args!("uim: card {state}"));
+                self.maybe_online(p);
             }
-            (id, r) => p.log(format_args!("qmi: response {id:#x} {r:?}")),
+            (NAS, nas::GET_SERVING_SYSTEM) => self.serving(p, m),
+            (NAS, nas::GET_SIGNAL_INFO) => self.signal(m),
+            (NAS, nas::GET_PLMN_NAME) => {
+                if let Some(n) = nas::plmn_name(m) {
+                    p.log(format_args!("nas: operator {n}"));
+                    self.status.operator = Text::new(&n);
+                }
+            }
+            (VOICE, voice::DIAL) => {
+                self.status.call.id = m.u8(0x10).unwrap_or(0);
+                if self.hangup_pending {
+                    self.hangup_pending = false;
+                    let _ = self.hangup(p);
+                }
+            }
+            _ => {} // the indication registrations, answer, end: their indications tell the rest
+        }
+    }
+
+    fn indication(&mut self, p: &mut dyn Platform, service: u32, m: &qmi::Msg) {
+        match (service, m.id) {
+            (NAS, nas::GET_SERVING_SYSTEM) => self.serving(p, m),
+            (NAS, nas::SIGNAL_INFO_IND) => self.signal(m),
+            (VOICE, voice::ALL_CALL_STATUS_IND) => {
+                let Some(c) = voice::all_call_status(m) else {
+                    return;
+                };
+                let old = self.status.call;
+                let number = match c.number {
+                    Some(n) => Text::new(&n),
+                    None if old.id == c.id || old.id == 0 => old.number,
+                    None => Text::default(),
+                };
+                self.status.call = Call {
+                    id: c.id,
+                    state: c.state,
+                    incoming: c.incoming,
+                    number,
+                };
+                if (old.id, old.state) != (c.id, c.state) {
+                    p.log(format_args!(
+                        "voice: call {} state {} {} {}",
+                        c.id,
+                        c.state,
+                        if c.incoming { "from" } else { "to" },
+                        mask(number.as_str())
+                    ));
+                }
+                if self.hangup_pending && c.id != 0 {
+                    self.hangup_pending = false;
+                    let _ = self.hangup(p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn serving(&mut self, p: &mut dyn Platform, m: &qmi::Msg) {
+        let Some(s) = nas::serving(m) else {
+            return;
+        };
+        if (s.reg, s.rat) != (self.status.reg, self.status.rat) {
+            p.log(format_args!("nas: registration {} rat {}", s.reg, s.rat));
+        }
+        self.status.reg = s.reg;
+        self.status.rat = s.rat;
+        let registered = matches!(s.reg, modem_ipc::reg::HOME | modem_ipc::reg::ROAMING);
+        if !registered {
+            self.status.bars = 0;
+            self.status.operator = Text::default();
+            self.plmn_asked = None;
+            return;
+        }
+        if let Some(n) = s.name {
+            self.status.operator = Text::new(&n);
+        } else if let Some((mcc, mnc)) = s.plmn.filter(|&q| self.plmn_asked != Some(q)) {
+            self.plmn_asked = Some((mcc, mnc));
+            let mut q = [0u8; 4];
+            q[..2].copy_from_slice(&mcc.to_le_bytes());
+            q[2..].copy_from_slice(&mnc.to_le_bytes());
+            self.request(p, NAS, nas::GET_PLMN_NAME, &[(0x01, &q)]);
+        }
+    }
+
+    fn signal(&mut self, m: &qmi::Msg) {
+        if let Some(b) = nas::bars(m) {
+            let registered = matches!(
+                self.status.reg,
+                modem_ipc::reg::HOME | modem_ipc::reg::ROAMING
+            );
+            self.status.bars = if registered { b } else { 0 };
         }
     }
 }
@@ -532,44 +808,187 @@ mod tests {
         assert_eq!(qrtr::ctrl_words(p), Some((7, [NODE, LOCATOR_PORT, 0, 0])));
     }
 
+    fn ns(service: u32, port: u32) -> Vec<u8> {
+        from_modem(
+            qrtr::TYPE_NEW_SERVER,
+            PORT_CTRL,
+            PORT_CTRL,
+            &qrtr::ctrl(4, [service, 1, 0, port]),
+        )
+    }
+
+    /// (our port, its port, message id, txn) of a packet we sent
+    fn req(pkt: &[u8]) -> (u32, u32, u16, u16) {
+        let (h, p) = qrtr::decode(pkt).unwrap();
+        let m = qmi::Msg::parse(p).unwrap();
+        (h.src_port, h.dst_port, m.id, m.txn)
+    }
+
+    fn ok(txn: u16, id: u16) -> qmi::Builder {
+        qmi::Builder::new(qmi::RESPONSE, txn, id).result(0)
+    }
+
     #[test]
-    fn dms_and_uim_answers() {
+    fn dms_and_uim_answers_then_online() {
         let (mut m, mut f) = (modem(), fake());
-        let ns = |s: u32, port: u32| {
-            from_modem(
-                qrtr::TYPE_NEW_SERVER,
-                PORT_CTRL,
-                PORT_CTRL,
-                &qrtr::ctrl(4, [s, 1, 0, port]),
-            )
-        };
         m.handle(&mut f, &ns(DMS, 68));
         assert_eq!(f.sent.len(), 2);
-        let (h, p) = qrtr::decode(&f.sent[0]).unwrap();
-        assert_eq!(
-            (h.src_port, h.dst_port, qmi::Msg::parse(p).unwrap().id),
-            (CLIENT_PORT, 68, DMS_GET_REVISION)
-        );
-        let rev = qmi::Builder::new(qmi::RESPONSE, 1, DMS_GET_REVISION)
-            .result(0)
-            .tlv(1, b"MPSS.AT.4.0.2")
-            .finish();
-        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 68, CLIENT_PORT, &rev));
+        assert_eq!(req(&f.sent[0]), (0x20, 68, DMS_GET_REVISION, 1));
+        assert_eq!(req(&f.sent[1]), (0x20, 68, DMS_GET_IDS, 2));
+        let rev = ok(1, DMS_GET_REVISION).tlv(1, b"MPSS.AT.4.0.2").finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 68, 0x20, &rev));
         assert_eq!(m.revision.as_deref(), Some("MPSS.AT.4.0.2"));
-        let ids = qmi::Builder::new(qmi::RESPONSE, 2, DMS_GET_IDS)
-            .result(0)
-            .tlv(0x11, b"351234567890123")
-            .finish();
-        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 68, CLIENT_PORT, &ids));
+        let ids = ok(2, DMS_GET_IDS).tlv(0x11, b"351234567890123").finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 68, 0x20, &ids));
         assert!(f.logs.iter().any(|l| l == "dms: IMEI 35xxxxxxxxxxx23"));
         assert!(!f.logs.iter().any(|l| l.contains("351234567890123")));
         m.handle(&mut f, &ns(UIM, 55));
-        let card = qmi::Builder::new(qmi::RESPONSE, 3, UIM_GET_CARD_STATUS)
-            .result(0)
+        assert_eq!(
+            req(f.sent.last().unwrap()),
+            (0x21, 55, UIM_GET_CARD_STATUS, 1)
+        );
+        // a response on a transaction we never sent is not ours
+        let stray = ok(9, UIM_GET_CARD_STATUS)
             .tlv(0x10, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1])
             .finish();
-        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, CLIENT_PORT, &card));
-        assert_eq!(m.card, Some(1));
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, 0x21, &stray));
+        assert_eq!(m.card, None);
+        let card = ok(1, UIM_GET_CARD_STATUS)
+            .tlv(0x10, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1])
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, 0x21, &card));
+        assert_eq!((m.card, m.status.sim), (Some(1), modem_ipc::sim::PRESENT));
+        let online = f.sent.last().unwrap().clone();
+        assert_eq!(req(&online), (0x20, 68, DMS_SET_OPERATING_MODE, 3));
+        let (_, pay) = qrtr::decode(&online).unwrap();
+        assert_eq!(qmi::Msg::parse(pay).unwrap().tlv(1), Some(&[0u8][..]));
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_DATA,
+                68,
+                0x20,
+                &ok(3, DMS_SET_OPERATING_MODE).finish(),
+            ),
+        );
+        assert_eq!(m.status.modem, modem_ipc::modem::ONLINE);
+    }
+
+    #[test]
+    fn nas_registration_name_and_bars() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(NAS, 51));
+        let ids: Vec<_> = f.sent.iter().map(|s| req(s).2).collect();
+        assert_eq!(
+            ids,
+            [
+                nas::REGISTER_INDICATIONS,
+                nas::GET_SERVING_SYSTEM,
+                nas::GET_SIGNAL_INFO
+            ]
+        );
+        let mut plmn = 283u16.to_le_bytes().to_vec();
+        plmn.extend_from_slice(&10u16.to_le_bytes());
+        plmn.push(0); // no description: ask for the name
+        let ind = qmi::Builder::new(qmi::INDICATION, 1, nas::GET_SERVING_SYSTEM)
+            .tlv(1, &[1, 1, 1, 2, 1, 8])
+            .tlv(0x12, &plmn)
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 51, 0x22, &ind));
+        assert_eq!(
+            (m.status.reg, m.status.rat),
+            (modem_ipc::reg::HOME, modem_ipc::rat::LTE)
+        );
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(id, nas::GET_PLMN_NAME);
+        let mut t = alloc::vec![0, 0, 0, 0, 0, 4];
+        t.extend_from_slice(b"Ucom");
+        t.extend_from_slice(&[0, 0, 0, 7]);
+        t.extend_from_slice(b"Ucom AM");
+        let name = ok(txn, nas::GET_PLMN_NAME).tlv(0x10, &t).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 51, 0x22, &name));
+        assert_eq!(m.status.operator.as_str(), "Ucom AM");
+        let sig = qmi::Builder::new(qmi::INDICATION, 2, nas::SIGNAL_INFO_IND)
+            .tlv(0x14, &[0xca, 0xee, 0xa3, 0xff, 0x24, 0x00])
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 51, 0x22, &sig));
+        assert_eq!(m.status.bars, 3);
+        let n = f.sent.len();
+        m.tick(&mut f, 10_000);
+        assert_eq!(f.sent.len(), n);
+        m.tick(&mut f, 40_000);
+        assert_eq!(f.sent.len(), n + 2);
+    }
+
+    #[test]
+    fn calls_out_and_in() {
+        let (mut m, mut f) = (modem(), fake());
+        assert_eq!(m.dial(&mut f, "+37400000012"), Err(KERR_NOT_READY));
+        m.handle(&mut f, &ns(VOICE, 50));
+        assert_eq!(req(f.sent.last().unwrap()).2, voice::INDICATION_REGISTER);
+        assert_eq!(m.dial(&mut f, "112"), Err(KERR_ARGUMENT));
+        assert_eq!(m.dial(&mut f, "+37400000012"), Ok(()));
+        assert!(f.logs.iter().all(|l| !l.contains("37400000012")));
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(id, voice::DIAL);
+        assert_eq!(m.dial(&mut f, "+37400000099"), Err(KERR_IN_USE));
+        // hang up before the modem numbered the call: sent once it has the id
+        assert_eq!(m.hangup(&mut f), Ok(()));
+        let n = f.sent.len();
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_DATA,
+                50,
+                0x23,
+                &ok(txn, voice::DIAL).u8(0x10, 1).finish(),
+            ),
+        );
+        assert_eq!(f.sent.len(), n + 1);
+        assert_eq!(req(f.sent.last().unwrap()).2, voice::END);
+        let status = |calls: &[u8]| {
+            qmi::Builder::new(qmi::INDICATION, 1, voice::ALL_CALL_STATUS_IND)
+                .tlv(1, calls)
+                .finish()
+        };
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_DATA,
+                50,
+                0x23,
+                &status(&[1, 1, 9, 0, 1, 3, 0, 0]),
+            ),
+        );
+        assert_eq!(
+            (m.status.call.state, m.status.call.number.as_str()),
+            (call::END, "+37400000012")
+        );
+        // incoming: answer refused during setup, accepted when incoming
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_DATA,
+                50,
+                0x23,
+                &status(&[1, 2, 0x0a, 0, 2, 3, 0, 0]),
+            ),
+        );
+        assert_eq!(m.answer(&mut f), Err(KERR_NOT_READY));
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_DATA,
+                50,
+                0x23,
+                &status(&[1, 2, 2, 0, 2, 3, 0, 0]),
+            ),
+        );
+        assert!(m.status.call.incoming);
+        assert_eq!(m.answer(&mut f), Ok(()));
+        let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        let a = qmi::Msg::parse(pay).unwrap();
+        assert_eq!((a.id, a.tlv(1)), (voice::ANSWER, Some(&[2u8][..])));
     }
 
     #[test]

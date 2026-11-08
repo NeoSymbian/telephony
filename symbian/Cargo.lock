@@ -30,8 +30,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b23ac50abb8261cb38c6e2a7192d3302e0836dac1628f6a93b82b4fad185897"
 
 [[package]]
+name = "modem-ipc"
+version = "0.1.0"
+
+[[package]]
 name = "modem-proto"
 version = "0.1.0"
+dependencies = [
+ "modem-ipc",
+]
 
 [[package]]
 name = "modemd"
