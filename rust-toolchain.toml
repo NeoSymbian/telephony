@@ -1,0 +1,5 @@
+[toolchain]
+# armv5te-none-eabi is a tier 3 target: core is built from source (build-std), which needs nightly + rust-src.
+channel = "nightly-2026-10-20"
+components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]
+profile = "minimal"
