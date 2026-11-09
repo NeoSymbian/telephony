@@ -9,6 +9,7 @@ resolver = "2"
 # NeoSymbian/e32-rs, the same revision as neoui
 e32 = { git = "https://github.com/NeoSymbian/e32-rs", rev = "e97e2ebcb242f5365d1b3f9d520646603e1e9056", features = ["critical-section"] }
 modem-proto = { path = "../crates/modem-proto" }
+ext4ro = { path = "../crates/ext4ro" }
 
 [profile.release]
 panic = "abort"

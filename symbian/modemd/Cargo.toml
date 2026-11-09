@@ -14,3 +14,4 @@ test = false
 [dependencies]
 e32.workspace = true
 modem-proto.workspace = true
+ext4ro.workspace = true

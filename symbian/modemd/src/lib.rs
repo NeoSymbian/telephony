@@ -28,6 +28,10 @@ const SEND: i32 = 0x4e0f;
 const RECV: i32 = 0x4e10;
 const PART_READ: i32 = 0x4e11;
 const RMTFS_MEM: i32 = 0x4e12;
+const IPA_START: i32 = 0x4e13;
+/// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
+const VENDOR: u32 = 4;
+const SECTOR: u64 = 512;
 const NOT_READY: i32 = -18;
 /// modemst1, modemst2, fsg, fsc (the phone's GPT, docs/telephony.md C0)
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
@@ -109,6 +113,8 @@ impl Platform for Hal {
 }
 
 enum Phase {
+    /// IPA's GSI firmware from vendor_a, then IPA powered and the firmware loaded (C5b)
+    Ipa,
     /// reading partition i (one per loop step)
     Read(usize),
     /// the kernel boots the modem; since t0
@@ -147,6 +153,30 @@ impl Daemon {
     /// One step of the work: Err(KErrNotSupported) when this machine has no modem (QEMU/Syborg).
     fn step(&mut self) -> Result<(), i32> {
         match self.phase {
+            Phase::Ipa => {
+                match ipa_firmware() {
+                    Ok((image, mdt_len)) => {
+                        let (r, _) = hal_io(
+                            IPA_START,
+                            Io {
+                                a: mdt_len as u32,
+                                b: 0,
+                                len: image.len() as u32,
+                                buf: image.as_ptr() as u32,
+                            },
+                        );
+                        dprintln!(
+                            "[modemd] ipa: firmware {} bytes (mdt {}) -> {}",
+                            image.len(),
+                            mdt_len,
+                            r
+                        );
+                    }
+                    Err(ext4ro::Error::Io(e)) if e == err::KERR_NOT_SUPPORTED => return Err(e),
+                    Err(e) => dprintln!("[modemd] ipa: no firmware from vendor_a ({:?})", e),
+                }
+                self.phase = Phase::Read(0); // the modem boots either way
+            }
             Phase::Read(i) => {
                 let n = PART_SIZES[i];
                 let mut v = vec![0u8; n];
@@ -257,6 +287,75 @@ impl Daemon {
     }
 }
 
+/// vendor_a through the kernel's read-only, sector-aligned PartRead.
+struct Vendor;
+
+impl ext4ro::Disk for Vendor {
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), i32> {
+        let first = offset / SECTOR * SECTOR;
+        let end = (offset + buf.len() as u64).div_ceil(SECTOR) * SECTOR;
+        let mut tmp = vec![0u8; (end - first) as usize];
+        let (r, _) = hal_io(
+            PART_READ,
+            Io {
+                a: VENDOR,
+                b: first as u32,
+                len: tmp.len() as u32,
+                buf: tmp.as_mut_ptr() as u32,
+            },
+        );
+        if r < 0 {
+            return Err(r);
+        }
+        let at = (offset - first) as usize;
+        buf.copy_from_slice(&tmp[at..at + buf.len()]);
+        Ok(())
+    }
+}
+
+/// IPA's GSI firmware as one ELF image: ipa_fws.mdt (headers + hash) with each ipa_fws.bNN at its p_offset, as
+/// Linux's mdt loader reads the split files; and the .mdt's length (the metadata TrustZone checks).
+fn ipa_firmware() -> Result<(Vec<u8>, usize), ext4ro::Error> {
+    let mut fs = ext4ro::Fs::open(Vendor)?;
+    let mdt = fs.find("firmware/ipa_fws.mdt")?;
+    let mdt = fs.read(&mdt)?;
+    let word =
+        |b: &[u8], at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize;
+    if mdt.len() < 0x34 || &mdt[..4] != b"\x7fELF" {
+        return Err(ext4ro::Error::Unsupported);
+    }
+    let (phoff, phnum) = (
+        word(&mdt, 28),
+        u16::from_le_bytes([mdt[44], mdt[45]]) as usize,
+    );
+    if phoff + 32 * phnum > mdt.len() {
+        return Err(ext4ro::Error::Unsupported);
+    }
+    let ph = |i: usize| {
+        (
+            word(&mdt, phoff + 32 * i + 4),
+            word(&mdt, phoff + 32 * i + 16),
+        )
+    }; // p_offset, p_filesz
+    let len = (0..phnum)
+        .map(|i| ph(i).0 + ph(i).1)
+        .fold(mdt.len(), usize::max);
+    let mut image = vec![0u8; len];
+    image[..mdt.len()].copy_from_slice(&mdt);
+    for i in 0..phnum {
+        let (off, size) = ph(i);
+        if size == 0 {
+            continue;
+        }
+        if let Ok(seg) = fs.find(&alloc::format!("firmware/ipa_fws.b{i:02}")) {
+            let seg = fs.read(&seg)?;
+            let n = seg.len().min(size);
+            image[off..off + n].copy_from_slice(&seg[..n]);
+        }
+    }
+    Ok((image, mdt.len()))
+}
+
 impl Service for Daemon {
     type Session = ();
 
@@ -327,7 +426,7 @@ fn main() -> i32 {
     };
     dprintln!("[modemd] start: serving NeoModem, reading the EFS partitions");
     let mut d = Daemon {
-        phase: Phase::Read(0),
+        phase: Phase::Ipa,
         images: Default::default(),
         modem: None,
         rx: vec![0u8; 0x2000],
