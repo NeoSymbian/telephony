@@ -2,7 +2,9 @@
 //! The NeoModem server's contract (docs/telephony.md C5): MODEMD.EXE serves it, neoui's SYSSTART is its client.
 //! - [`op::STATUS`]: the server writes [`Status::SIZE`] bytes ([`Status::to_bytes`]) into the des8 in arg 0;
 //! - [`op::DIAL`]: arg 0 = the number (des8, ASCII digits, `+`, `*`, `#`);
-//! - [`op::ANSWER`], [`op::HANGUP`]: no arguments.
+//! - [`op::ANSWER`], [`op::HANGUP`]: no arguments;
+//! - in a call (C6): [`op::MUTE`] arg 0 = 1/0 (the mic), [`op::SPEAKER`] arg 0 = 1/0 (loudspeaker or earpiece),
+//!   [`op::VOLUME`] arg 0 = 0..=10, [`op::DTMF`] arg 0 = the key (`0-9`, `*`, `#`) or -1 to stop its tone.
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -10,13 +12,17 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (1, 0, 0);
+pub const VERSION: (i8, i8, i16) = (1, 1, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
     pub const DIAL: i32 = 2;
     pub const ANSWER: i32 = 3;
     pub const HANGUP: i32 = 4;
+    pub const MUTE: i32 = 5;
+    pub const SPEAKER: i32 = 6;
+    pub const VOLUME: i32 = 7;
+    pub const DTMF: i32 = 8;
 }
 
 /// [`Status::modem`]
@@ -103,6 +109,17 @@ pub struct Call {
     pub number: Text,
 }
 
+/// The call's audio (C6): what the in-call buttons show.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Audio {
+    /// the audio path runs (a call is connected and the ADSP carries it)
+    pub on: bool,
+    pub muted: bool,
+    pub speaker: bool,
+    /// 0..=10
+    pub volume: u8,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Status {
     pub modem: u8,
@@ -113,10 +130,12 @@ pub struct Status {
     pub bars: u8,
     pub operator: Text,
     pub call: Call,
+    pub audio: Audio,
 }
 
 impl Status {
-    pub const SIZE: usize = 8 + 2 * (1 + TEXT);
+    /// v1.0's 74 bytes, then the audio's 4 (v1.1); a v1.0 reader takes the first 74
+    pub const SIZE: usize = 8 + 2 * (1 + TEXT) + 4;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -135,12 +154,27 @@ impl Status {
             b[at] = t.len;
             b[at + 1..at + 1 + TEXT].copy_from_slice(&t.buf);
         }
+        let a = self.audio;
+        b[Self::SIZE - 4..].copy_from_slice(&[
+            a.on as u8,
+            a.muted as u8,
+            a.speaker as u8,
+            a.volume,
+        ]);
         b
     }
 
-    /// None if `b` is too short or a text length is out of range.
+    /// None if `b` is too short or a text length is out of range (a v1.0 server's 74 bytes: no audio).
     pub fn from_bytes(b: &[u8]) -> Option<Self> {
-        let b = b.get(..Self::SIZE)?;
+        let audio = b
+            .get(Self::SIZE - 4..Self::SIZE)
+            .map_or(Audio::default(), |a| Audio {
+                on: a[0] != 0,
+                muted: a[1] != 0,
+                speaker: a[2] != 0,
+                volume: a[3],
+            });
+        let b = b.get(..Self::SIZE - 4)?;
         let text = |i: usize| {
             let at = 8 + i * (1 + TEXT);
             let len = b[at];
@@ -161,6 +195,7 @@ impl Status {
                 incoming: b[7] != 0,
                 number: text(1)?,
             },
+            audio,
         })
     }
 }
@@ -184,10 +219,19 @@ mod tests {
                 incoming: true,
                 number: Text::new("+37400000012"),
             },
+            audio: Audio {
+                on: true,
+                muted: true,
+                speaker: false,
+                volume: 7,
+            },
         };
         let b = s.to_bytes();
         assert_eq!(Status::from_bytes(&b), Some(s));
         assert_eq!(Status::from_bytes(&b[..10]), None);
+        // a v1.0 server: no audio bytes
+        let old = Status::from_bytes(&b[..Status::SIZE - 4]).unwrap();
+        assert_eq!((old.call, old.audio), (s.call, Audio::default()));
     }
 
     #[test]

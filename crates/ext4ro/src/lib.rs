@@ -173,6 +173,29 @@ impl<D: Disk> Fs<D> {
         Ok(out)
     }
 
+    /// Up to `buf.len()` bytes of the file from `offset` (holes read as zeros): how many were read, 0 at the end.
+    /// For files too big to hold whole (the ADSP's 7.5 MB segment).
+    pub fn read_at(&mut self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
+        let bs = self.block_size as u64;
+        let n = (inode.size.saturating_sub(offset)).min(buf.len() as u64) as usize;
+        let mut block = vec![0u8; bs as usize];
+        let mut done = 0;
+        while done < n {
+            let at = offset + done as u64;
+            let (lblk, skip) = (at / bs, (at % bs) as usize);
+            let take = (bs as usize - skip).min(n - done);
+            match self.map(inode, lblk as u32)? {
+                Some(p) => {
+                    self.disk.read(p * bs, &mut block)?;
+                    buf[done..done + take].copy_from_slice(&block[skip..skip + take]);
+                }
+                None => buf[done..done + take].fill(0),
+            }
+            done += take;
+        }
+        Ok(n)
+    }
+
     /// The inode number of `name` in the directory `dir`.
     pub fn lookup(&mut self, dir: &Inode, name: &str) -> Result<u32, Error> {
         let data = self.read(dir)?;
@@ -248,6 +271,23 @@ mod tests {
             fs.find("firmware/no_such_file"),
             Err(Error::NotFound)
         ));
+    }
+
+    #[test]
+    fn read_at_matches_read() {
+        let Some(mut fs) = image() else {
+            eprintln!("EXT4RO_IMAGE not set: skipped");
+            return;
+        };
+        let seg = fs.find("firmware/adsp.b04").unwrap();
+        let whole = fs.read(&seg).unwrap();
+        let mut part = std::vec![0u8; 10_000];
+        for off in [0u64, 1, 4095, 4096, whole.len() as u64 - 5000] {
+            let n = fs.read_at(&seg, off, &mut part).unwrap();
+            assert_eq!(n, part.len().min(whole.len() - off as usize));
+            assert_eq!(&part[..n], &whole[off as usize..off as usize + n]);
+        }
+        assert_eq!(fs.read_at(&seg, whole.len() as u64, &mut part).unwrap(), 0);
     }
 
     #[test]

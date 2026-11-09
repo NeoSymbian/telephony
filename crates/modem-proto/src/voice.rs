@@ -13,6 +13,9 @@ pub const DIAL: u16 = 0x20;
 pub const END: u16 = 0x21;
 pub const ANSWER: u16 = 0x22;
 pub const ALL_CALL_STATUS_IND: u16 = 0x2e;
+/// a keypad tone to the far end while held (libqmi Start/Stop Continuous DTMF: TLV 1 {call id, digit} / {call id})
+pub const START_CONT_DTMF: u16 = 0x29;
+pub const STOP_CONT_DTMF: u16 = 0x2a;
 
 /// Indication Register: call notifications (0x13) on.
 pub const INDICATIONS: [(u8, &[u8]); 1] = [(0x13, &[1])];

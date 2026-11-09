@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod apr;
 pub mod ipa;
 pub mod locator;
 pub mod nas;
@@ -26,8 +27,8 @@ use qrtr::{Header, NODE_BCAST, PORT_CTRL};
 
 /// What the router needs from the system.
 pub trait Platform {
-    /// One whole QRTR packet to the modem (GLINK IPCRTR).
-    fn send(&mut self, packet: &[u8]) -> Result<(), i32>;
+    /// One whole QRTR packet to `node`: the modem (node 0) or the ADSP, each on its own GLINK IPCRTR.
+    fn send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32>;
     /// The rmtfs carve-out the modem reads its EFS from.
     fn rmtfs_read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), i32>;
     fn rmtfs_write(&mut self, offset: u32, data: &[u8]) -> Result<(), i32>;
@@ -114,7 +115,8 @@ pub struct Modem {
     transfers: Vec<tftp::Transfer>,
     next_port: u32,
     clients: Vec<Client>,
-    hello_seen: bool,
+    /// the nodes whose HELLO we answered (the modem, the ADSP)
+    hello_seen: Vec<u32>,
     online_sent: bool,
     plmn_asked: Option<(u16, u16)>,
     hangup_pending: bool,
@@ -145,7 +147,7 @@ impl Modem {
             transfers: Vec::new(),
             next_port: FIRST_TRANSFER_PORT,
             clients: Vec::new(),
-            hello_seen: false,
+            hello_seen: Vec::new(),
             online_sent: false,
             plmn_asked: None,
             hangup_pending: false,
@@ -177,7 +179,7 @@ impl Modem {
         if self.trace {
             trace(p, ">", &h, payload);
         }
-        if let Err(e) = p.send(&qrtr::encode(&h, payload)) {
+        if let Err(e) = p.send(dst.0, &qrtr::encode(&h, payload)) {
             p.log(format_args!(
                 "qrtr: send type {ty} to {}:{} failed ({e})",
                 dst.0, dst.1 as i32
@@ -383,6 +385,23 @@ impl Modem {
             .ok_or(KERR_NOT_READY)
     }
 
+    /// A keypad tone during a connected call (modem_ipc::op::DTMF): `Some(key)` starts it (`0-9`, `*`, `#`), `None`
+    /// stops it.
+    pub fn dtmf(&mut self, p: &mut dyn Platform, key: Option<u8>) -> Result<(), i32> {
+        let c = self.status.call;
+        if c.state != call::CONVERSATION || c.id == 0 {
+            return Err(KERR_NOT_READY);
+        }
+        let sent = match key {
+            Some(k) if k.is_ascii_digit() || k == b'*' || k == b'#' => {
+                self.request(p, VOICE, voice::START_CONT_DTMF, &[(0x01, &[c.id, k])])
+            }
+            Some(_) => return Err(KERR_ARGUMENT),
+            None => self.request(p, VOICE, voice::STOP_CONT_DTMF, &[(0x01, &[c.id])]),
+        };
+        sent.then_some(()).ok_or(KERR_NOT_READY)
+    }
+
     /// One QRTR packet from the modem.
     pub fn handle(&mut self, p: &mut dyn Platform, packet: &[u8]) {
         let Some((h, payload)) = qrtr::decode(packet) else {
@@ -413,8 +432,8 @@ impl Modem {
         }
         match h.ty {
             qrtr::TYPE_DATA => self.data(p, &h, payload),
-            qrtr::TYPE_HELLO if !self.hello_seen => {
-                self.hello_seen = true;
+            qrtr::TYPE_HELLO if !self.hello_seen.contains(&h.src_node) => {
+                self.hello_seen.push(h.src_node);
                 self.ctrl(p, qrtr::TYPE_HELLO, (h.src_node, PORT_CTRL), [0; 4]);
                 self.announce(p, (h.src_node, PORT_CTRL));
             }
@@ -770,13 +789,15 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         sent: Vec<Vec<u8>>,
+        nodes: Vec<u32>,
         mem: Vec<u8>,
         logs: Vec<String>,
     }
 
     impl Platform for Fake {
-        fn send(&mut self, packet: &[u8]) -> Result<(), i32> {
+        fn send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32> {
             self.sent.push(packet.to_vec());
+            self.nodes.push(node);
             Ok(())
         }
         fn rmtfs_read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), i32> {
@@ -840,6 +861,52 @@ mod tests {
             (qrtr::TYPE_NEW_SERVER, 0, PORT_CTRL)
         );
         assert_eq!(qrtr::ctrl_words(p), Some((4, [14, 1, 1, RMTFS_PORT])));
+    }
+
+    // C6: the ADSP's router (node 5) says HELLO on its own IPCRTR; its audio PD then asks our locator for avs/audio
+    #[test]
+    fn the_adsp_gets_hello_services_and_the_locator() {
+        let (mut m, mut f) = (modem(), fake());
+        let adsp = |ty, src_port, dst_port, payload: &[u8]| {
+            let h = Header {
+                ty,
+                src_node: 5,
+                src_port,
+                dst_node: NODE,
+                dst_port,
+                ..Default::default()
+            };
+            qrtr::encode(&h, payload)
+        };
+        m.handle(
+            &mut f,
+            &adsp(
+                qrtr::TYPE_HELLO,
+                PORT_CTRL,
+                PORT_CTRL,
+                &qrtr::ctrl(qrtr::TYPE_HELLO, [0; 4]),
+            ),
+        );
+        assert!(f.sent.len() >= 4 && f.nodes.iter().all(|&n| n == 5));
+        let (h, _) = qrtr::decode(&f.sent[0]).unwrap();
+        assert_eq!((h.ty, h.dst_node), (qrtr::TYPE_HELLO, 5));
+        let before = f.sent.len();
+        m.handle(
+            &mut f,
+            &adsp(
+                qrtr::TYPE_HELLO,
+                PORT_CTRL,
+                PORT_CTRL,
+                &qrtr::ctrl(qrtr::TYPE_HELLO, [0; 4]),
+            ),
+        );
+        assert_eq!(f.sent.len(), before); // one HELLO per node
+        let q = qmi::Builder::new(qmi::REQUEST, 3, 0x20)
+            .tlv(1, b"avs/audio")
+            .finish();
+        m.handle(&mut f, &adsp(qrtr::TYPE_DATA, 0x4001, LOCATOR_PORT, &q));
+        assert_eq!(*f.nodes.last().unwrap(), 5);
+        assert_eq!(reply(&f).result(), Some(Ok(())));
     }
 
     // the C1 sequence (rmtfs.log 2026-11-08): open fs1, alloc 2 MB, read sector 1 x 1 to +0x200
@@ -1158,6 +1225,33 @@ mod tests {
         let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
         let a = qmi::Msg::parse(pay).unwrap();
         assert_eq!((a.id, a.tlv(1)), (voice::ANSWER, Some(&[2u8][..])));
+    }
+
+    #[test]
+    fn keypad_tones_only_in_a_connected_call() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        assert_eq!(m.dtmf(&mut f, Some(b'5')), Err(KERR_NOT_READY));
+        let conversation = qmi::Builder::new(qmi::INDICATION, 1, voice::ALL_CALL_STATUS_IND)
+            .tlv(1, &[1, 3, 3, 0, 2, 3, 0, 0])
+            .finish();
+        m.handle(
+            &mut f,
+            &from_modem(qrtr::TYPE_DATA, 50, 0x23, &conversation),
+        );
+        assert_eq!(m.status.call.state, call::CONVERSATION);
+        assert_eq!(m.dtmf(&mut f, Some(b'x')), Err(KERR_ARGUMENT));
+        assert_eq!(m.dtmf(&mut f, Some(b'#')), Ok(()));
+        let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        let q = qmi::Msg::parse(pay).unwrap();
+        assert_eq!(
+            (q.id, q.tlv(1)),
+            (voice::START_CONT_DTMF, Some(&[3u8, b'#'][..]))
+        );
+        assert_eq!(m.dtmf(&mut f, None), Ok(()));
+        let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        let q = qmi::Msg::parse(pay).unwrap();
+        assert_eq!((q.id, q.tlv(1)), (voice::STOP_CONT_DTMF, Some(&[3u8][..])));
     }
 
     #[test]

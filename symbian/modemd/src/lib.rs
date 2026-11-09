@@ -8,6 +8,8 @@
 
 extern crate alloc;
 
+mod adsp;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -36,6 +38,8 @@ const NOT_READY: i32 = -18;
 /// modemst1, modemst2, fsg, fsc (the phone's GPT, docs/telephony.md C0)
 const PART_SIZES: [usize; 4] = [0x20_0000, 0x20_0000, 0x20_0000, 0x2_0000];
 const RUNNING: u32 = 8;
+/// the modem's QRTR node; every other node is behind the ADSP's IPCRTR
+const MODEM_NODE: u32 = 0;
 const FATAL: u32 = 1;
 const BOOT_TIMEOUT_MS: u64 = 60_000;
 const STATUS_LOG_MS: u64 = 30_000;
@@ -69,7 +73,10 @@ fn state() -> [u32; 4] {
 struct Hal;
 
 impl Platform for Hal {
-    fn send(&mut self, packet: &[u8]) -> Result<(), i32> {
+    fn send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32> {
+        if node != MODEM_NODE {
+            return adsp::send(adsp::RING_QRTR, packet); // the ADSP's router (C6)
+        }
         for _ in 0..50 {
             let r = hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8);
             match r {
@@ -136,11 +143,21 @@ struct Daemon {
     fatal_seen: bool,
     /// the kernel runs IPA: LTE allowed, the IPA handshake on (else voice-only)
     ipa_up: bool,
+    /// the audio DSP (C6): loaded once the modem runs
+    adsp: adsp::Adsp,
+    /// the call's audio path and the in-call buttons' settings (C6)
+    audio: adsp::CallAudio,
+    /// the call state the audio last followed
+    audio_call: u8,
+    /// a keypad tone ends here (ms): one tap = one 200 ms tone
+    dtmf_stop: Option<u64>,
 }
 
 impl Daemon {
     fn status(&self) -> Status {
-        self.modem.as_ref().map_or(self.status, |m| m.status)
+        let mut s = self.modem.as_ref().map_or(self.status, |m| m.status);
+        s.audio = self.audio.status();
+        s
     }
 
     fn fail(&mut self, what: &str, r: i32) {
@@ -229,6 +246,15 @@ impl Daemon {
         Ok(())
     }
 
+    /// An audio setting to the kernel's codecs while the call's audio runs (else it waits for the next call).
+    fn apply(&mut self, op: u32, arg: u32) -> i32 {
+        if !self.audio.apr.running {
+            return err::KERR_NONE;
+        }
+        let r = adsp::audio(op, arg);
+        if r < 0 { r } else { err::KERR_NONE }
+    }
+
     fn boot(&mut self) {
         let (r, info) = hal_io(RMTFS_MEM, Io::default());
         if r < 0 {
@@ -267,6 +293,32 @@ impl Daemon {
                 break;
             }
             modem.handle(&mut Hal, &buf[..r as usize]);
+        }
+        if self.adsp.busy() {
+            self.adsp.step();
+        }
+        while let Some(n) = adsp::recv(adsp::RING_QRTR, buf) {
+            modem.handle(&mut Hal, &buf[..n]);
+        }
+        // the call's audio follows the call: on once connected (the ADSP up), off when it ends
+        let call_state = modem.status.call.state;
+        if call_state != self.audio_call {
+            self.audio_call = call_state;
+            let talking = call_state == modem_ipc::call::CONVERSATION;
+            if talking && !self.audio.apr.running && matches!(self.adsp, adsp::Adsp::Up) {
+                dprintln!("[modemd] audio: call connected, starting the voice path");
+                self.audio.apr.start();
+            } else if !talking && self.audio.apr.running {
+                dprintln!("[modemd] audio: call over, stopping the voice path");
+                self.audio.apr.stop();
+            }
+        }
+        if matches!(self.adsp, adsp::Adsp::Up) {
+            self.audio.pump(buf);
+        }
+        if self.dtmf_stop.is_some_and(|t| time::millis() >= t) {
+            self.dtmf_stop = None;
+            let _ = modem.dtmf(&mut Hal, None);
         }
         let now = time::millis();
         modem.tick(&mut Hal, now);
@@ -419,6 +471,30 @@ impl Service for Daemon {
             op::HANGUP => self.modem.as_mut().map_or(NOT_READY, |m| {
                 m.hangup(&mut Hal).err().unwrap_or(err::KERR_NONE)
             }),
+            // the in-call buttons (C6): remembered for the next call too, applied now if the audio runs
+            op::MUTE => {
+                self.audio.muted = msg.int(0) != 0;
+                self.apply(5, self.audio.muted as u32)
+            }
+            op::SPEAKER => {
+                self.audio.speaker = msg.int(0) != 0;
+                self.apply(3, self.audio.speaker as u32)
+            }
+            op::VOLUME => {
+                self.audio.volume = msg.int(0).clamp(0, 10) as u8;
+                self.apply(4, self.audio.volume as u32)
+            }
+            op::DTMF => {
+                let k = msg.int(0);
+                let key = (k >= 0).then_some(k as u8);
+                let r = self.modem.as_mut().map_or(NOT_READY, |m| {
+                    m.dtmf(&mut Hal, key).err().unwrap_or(err::KERR_NONE)
+                });
+                if r == err::KERR_NONE && key.is_some() {
+                    self.dtmf_stop = Some(time::millis() + 200);
+                }
+                r
+            }
             _ => err::KERR_NOT_SUPPORTED,
         };
         msg.complete(r);
@@ -448,11 +524,23 @@ fn main() -> i32 {
         last_log: 0,
         fatal_seen: false,
         ipa_up: false,
+        adsp: adsp::Adsp::Idle,
+        audio: adsp::CallAudio::new(),
+        audio_call: 0,
+        dtmf_stop: None,
     };
     rt::block_on(async {
         let mut receive = pin!(server.receive());
         loop {
-            match rt::select(receive.as_mut(), time::delay(2000)).await {
+            // fast while the ADSP loads (its steps) or a call's audio runs; else every 2 s
+            let fast =
+                d.adsp.busy() || d.audio.busy() || d.audio_call == modem_ipc::call::CONVERSATION;
+            let ms = if matches!(d.phase, Phase::Running) && fast {
+                20
+            } else {
+                2000
+            };
+            match rt::select(receive.as_mut(), time::delay(ms)).await {
                 Either::Left(Ok(msg)) => {
                     receive.set(server.receive());
                     let _ = server::dispatch(&mut d, msg);
