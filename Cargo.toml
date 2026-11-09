@@ -2,5 +2,5 @@
 # Host workspace: the protocol crates, no_std + alloc, unit-tested on the Mac with `cargo test`.
 # The Symbian EXE (MODEMD.EXE) is in symbian/, its own workspace built only for armv5te-none-eabi (`cargo arm`).
 [workspace]
-members = ["crates/modem-ipc", "crates/modem-proto"]
+members = ["crates/ext4ro", "crates/modem-ipc", "crates/modem-proto"]
 resolver = "2"
