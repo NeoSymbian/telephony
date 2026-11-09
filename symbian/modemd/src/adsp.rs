@@ -2,7 +2,7 @@
 //! The ADSP, the audio DSP (docs/telephony.md C6): its firmware from vendor_a streamed to the kernel, which has
 //! TrustZone authenticate and start it (HAL AdspLoad, PAS 1), then its two GLINK channels: IPCRTR (QRTR, the same
 //! router as the modem's: the audio PD asks our locator for avs/audio) and APR (the audio services).
-//! The load runs in steps of the daemon's loop (half a megabyte each), so NeoModem keeps answering.
+//! The load runs in steps of the daemon's loop (256 KB each), so NeoModem and the modem keep being served.
 
 use crate::{Io, NOT_READY, Vendor, hal_io};
 use alloc::format;
@@ -18,7 +18,7 @@ pub const CHAN_RECV: i32 = 0x4e17;
 pub const RING_QRTR: u32 = 1;
 pub const RING_APR: u32 = 2;
 const CHUNK: usize = 0x1_0000;
-const STEP_BYTES: usize = 0x8_0000;
+const STEP_BYTES: usize = 0x4_0000;
 const BOOT_TIMEOUT_MS: u64 = 15_000;
 /// AdspState step once the ADSP runs and its channels are open (qcom_adsp.cpp)
 const STEP_RUNNING: u32 = 3;

@@ -110,6 +110,9 @@ pub struct Modem {
     /// the modem asserts in its IPA path ("IPA Assert: new_free_space > 0", C5).
     pub ipa_up: bool,
     ipa: ipa::Handshake,
+    /// INIT_DRIVER couldn't go out yet: tick retries it (last tried at ipa_init_at)
+    ipa_init_due: bool,
+    ipa_init_at: u64,
     /// What NeoModem clients see (modem_ipc::op::STATUS)
     pub status: Status,
     transfers: Vec<tftp::Transfer>,
@@ -156,9 +159,12 @@ impl Modem {
             selection_sent: false,
             ipa_up: false,
             ipa: ipa::Handshake::default(),
+            ipa_init_due: false,
+            ipa_init_at: 0,
         }
     }
 
+    /// One packet out; false if the transport refused it (logged).
     fn send(
         &mut self,
         p: &mut dyn Platform,
@@ -166,7 +172,7 @@ impl Modem {
         src_port: u32,
         dst: (u32, u32),
         payload: &[u8],
-    ) {
+    ) -> bool {
         let h = Header {
             ty,
             src_node: NODE,
@@ -184,7 +190,9 @@ impl Modem {
                 "qrtr: send type {ty} to {}:{} failed ({e})",
                 dst.0, dst.1 as i32
             ));
+            return false;
         }
+        true
     }
 
     fn ctrl(&mut self, p: &mut dyn Platform, ty: u32, dst: (u32, u32), words: [u32; 4]) {
@@ -216,7 +224,8 @@ impl Modem {
         self.announce(p, (MODEM_NODE, PORT_CTRL));
     }
 
-    /// One QMI request from our client of `service`; false if the modem hasn't announced that service.
+    /// One QMI request from our client of `service`; false if the modem hasn't announced that service or the
+    /// transport refused the packet.
     fn request(
         &mut self,
         p: &mut dyn Platform,
@@ -237,8 +246,7 @@ impl Modem {
         }
         c.pending.push((c.txn, id));
         let (port, dst) = (c.port, c.dst);
-        self.send(p, qrtr::TYPE_DATA, port, dst, &b.finish());
-        true
+        self.send(p, qrtr::TYPE_DATA, port, dst, &b.finish())
     }
 
     /// The first requests once the modem announces a service we are a client of.
@@ -275,13 +283,24 @@ impl Modem {
                 self.request(p, VOICE, voice::INDICATION_REGISTER, &voice::INDICATIONS);
             }
             _ if self.ipa_up => {
-                // the modem's IPA server (0x31 instance 2): where IPA's tables are
-                let tlvs = ipa::init_driver_tlvs();
-                let refs: Vec<(u8, &[u8])> = tlvs.iter().map(|(t, v)| (*t, v.as_slice())).collect();
-                self.request(p, IPA, ipa::INIT_DRIVER, &refs);
+                // the modem's IPA server (0x31 instance 2): where IPA's tables are. It must arrive: without it the
+                // modem's LTE downlink asserts within a minute ("IPA Assert: new_free_space > 0", C6 2026-11-09)
+                self.ipa_init_due = !self.init_driver(p);
             }
             _ => {}
         }
+    }
+
+    /// INIT_DRIVER to the modem's IPA server: true once sent.
+    fn init_driver(&mut self, p: &mut dyn Platform) -> bool {
+        let tlvs = ipa::init_driver_tlvs();
+        let refs: Vec<(u8, &[u8])> = tlvs.iter().map(|(t, v)| (*t, v.as_slice())).collect();
+        let sent = self.request(p, IPA, ipa::INIT_DRIVER, &refs);
+        p.log(format_args!(
+            "ipa: INIT_DRIVER {}",
+            if sent { "sent" } else { "not sent yet" }
+        ));
+        sent
     }
 
     /// IPA's INIT_COMPLETE indication, from our server to the modem's IPA server, once the handshake is in.
@@ -316,6 +335,10 @@ impl Modem {
 
     /// The periodic work: NAS serving system and signal every 30 s. `now_ms` is any monotonic clock.
     pub fn tick(&mut self, p: &mut dyn Platform, now_ms: u64) {
+        if self.ipa_init_due && now_ms.saturating_sub(self.ipa_init_at) >= 2000 {
+            self.ipa_init_at = now_ms; // every 2 s until it goes out (a refused send takes up to 2 s)
+            self.ipa_init_due = !self.init_driver(p);
+        }
         if now_ms.saturating_sub(self.last_poll) < POLL_MS {
             return;
         }
@@ -494,8 +517,18 @@ impl Modem {
                     return;
                 }
                 let resp = self.ipa.request(&m);
-                p.log(format_args!("ipa: request {:#x} from the modem", m.id));
-                self.send(p, qrtr::TYPE_DATA, IPA_PORT, from, &resp);
+                p.log(format_args!(
+                    "ipa: request {:#x} from the modem{}",
+                    m.id,
+                    if resp.is_some() {
+                        ""
+                    } else {
+                        " (no handler: unanswered, as Linux)"
+                    }
+                ));
+                if let Some(resp) = resp {
+                    self.send(p, qrtr::TYPE_DATA, IPA_PORT, from, &resp);
+                }
                 self.ipa_complete(p);
             }
             RMTFS_PORT | LOCATOR_PORT => {
@@ -790,12 +823,18 @@ mod tests {
     struct Fake {
         sent: Vec<Vec<u8>>,
         nodes: Vec<u32>,
+        /// refuse this many sends (no receive intent yet)
+        refuse: usize,
         mem: Vec<u8>,
         logs: Vec<String>,
     }
 
     impl Platform for Fake {
         fn send(&mut self, node: u32, packet: &[u8]) -> Result<(), i32> {
+            if self.refuse > 0 {
+                self.refuse -= 1;
+                return Err(KERR_NOT_READY);
+            }
             self.sent.push(packet.to_vec());
             self.nodes.push(node);
             Ok(())
@@ -1225,6 +1264,29 @@ mod tests {
         let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
         let a = qmi::Msg::parse(pay).unwrap();
         assert_eq!((a.id, a.tlv(1)), (voice::ANSWER, Some(&[2u8][..])));
+    }
+
+    // C6 2026-11-09: INIT_DRIVER refused during the modem's start-up burst was dropped, and LTE asserted
+    #[test]
+    fn init_driver_is_retried_until_it_goes_out() {
+        let (mut m, mut f) = (modem(), fake());
+        m.ipa_up = true;
+        f.refuse = 1;
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_NEW_SERVER,
+                PORT_CTRL,
+                PORT_CTRL,
+                &qrtr::ctrl(4, [ipa::SERVICE, qrtr::instance_word(1, 2), 0, 30]),
+            ),
+        );
+        assert!(f.sent.iter().all(|p| req(p).2 != ipa::INIT_DRIVER));
+        m.tick(&mut f, 2000);
+        assert_eq!(req(f.sent.last().unwrap()).2, ipa::INIT_DRIVER);
+        let n = f.sent.len();
+        m.tick(&mut f, 4000);
+        assert!(f.sent[n..].iter().all(|p| req(p).2 != ipa::INIT_DRIVER)); // once
     }
 
     #[test]

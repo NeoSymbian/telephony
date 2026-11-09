@@ -43,6 +43,8 @@ const MODEM_NODE: u32 = 0;
 const FATAL: u32 = 1;
 const BOOT_TIMEOUT_MS: u64 = 60_000;
 const STATUS_LOG_MS: u64 = 30_000;
+/// the ADSP loads once the modem's start-up traffic has settled (they overlapped badly: C6 2026-11-09)
+const ADSP_AFTER_MS: u64 = 20_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -77,10 +79,12 @@ impl Platform for Hal {
         if node != MODEM_NODE {
             return adsp::send(adsp::RING_QRTR, packet); // the ADSP's router (C6)
         }
-        for _ in 0..50 {
+        // no receive intent from the modem yet: retry briefly, never long (a 100 s block lost the modem's
+        // announcements, UIM among them: C6 2026-11-09)
+        for _ in 0..10 {
             let r = hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8);
             match r {
-                NOT_READY => time::sleep(2000), // no receive intent from the modem yet
+                NOT_READY => time::sleep(200),
                 r if r < 0 => return Err(r),
                 _ => return Ok(()),
             }
@@ -294,7 +298,7 @@ impl Daemon {
             }
             modem.handle(&mut Hal, &buf[..r as usize]);
         }
-        if self.adsp.busy() {
+        if self.adsp.busy() && time::millis() - self.t0 >= ADSP_AFTER_MS {
             self.adsp.step();
         }
         while let Some(n) = adsp::recv(adsp::RING_QRTR, buf) {
@@ -533,8 +537,8 @@ fn main() -> i32 {
         let mut receive = pin!(server.receive());
         loop {
             // fast while the ADSP loads (its steps) or a call's audio runs; else every 2 s
-            let fast =
-                d.adsp.busy() || d.audio.busy() || d.audio_call == modem_ipc::call::CONVERSATION;
+            let loading = d.adsp.busy() && time::millis() - d.t0 >= ADSP_AFTER_MS;
+            let fast = loading || d.audio.busy() || d.audio_call == modem_ipc::call::CONVERSATION;
             let ms = if matches!(d.phase, Phase::Running) && fast {
                 20
             } else {

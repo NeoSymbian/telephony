@@ -57,19 +57,22 @@ pub struct Handshake {
 }
 
 impl Handshake {
-    /// A request from the modem to our server: the response to send back.
-    pub fn request(&mut self, m: &Msg) -> Vec<u8> {
+    /// A request from the modem to our server: the response to send back, or None for one Linux has no handler for
+    /// (its QMI core then sends nothing). An error answer to the modem's INSTALL_FILTER_RULE (0x23) or CONFIG (0x27)
+    /// makes it assert ("ipa_qmi_client.c:754 ... resp.result == QMI_RESULT_SUCCESS", C6 2026-11-09); silence, as
+    /// under C1 Linux, it lives with.
+    pub fn request(&mut self, m: &Msg) -> Option<Vec<u8>> {
         let r = Builder::new(RESPONSE, m.txn, m.id);
         match m.id {
             DRIVER_INIT_COMPLETE => {
                 self.uc_ready = true;
-                r.result(0).finish()
+                Some(r.result(0).finish())
             }
             INDICATION_REGISTER => {
                 self.indications = true;
-                r.result(0).finish()
+                Some(r.result(0).finish())
             }
-            _ => r.result(0x47).finish(), // QMI_ERR_NOT_SUPPORTED
+            _ => None,
         }
     }
 
@@ -107,7 +110,7 @@ mod tests {
         let mut h = Handshake::default();
         let req = |id| Builder::new(REQUEST, 7, id).u8(0x01, 0).finish();
         let r = req(DRIVER_INIT_COMPLETE);
-        let resp = h.request(&Msg::parse(&r).unwrap());
+        let resp = h.request(&Msg::parse(&r).unwrap()).unwrap();
         assert_eq!(Msg::parse(&resp).unwrap().result(), Some(Ok(())));
         assert!(!h.complete_due());
         let r = req(INDICATION_REGISTER);
@@ -116,5 +119,8 @@ mod tests {
         h.modem_ready = true;
         assert!(h.complete_due());
         assert!(!h.complete_due());
+        // the modem's filter-rule and config requests: no answer (as Linux)
+        assert!(h.request(&Msg::parse(&req(0x23)).unwrap()).is_none());
+        assert!(h.request(&Msg::parse(&req(0x27)).unwrap()).is_none());
     }
 }
