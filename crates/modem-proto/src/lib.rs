@@ -14,6 +14,7 @@ pub mod nas;
 pub mod qmi;
 pub mod qrtr;
 pub mod rmtfs;
+pub mod ssctl;
 pub mod tftp;
 pub mod voice;
 
@@ -41,6 +42,8 @@ const RMTFS_PORT: u32 = 0x10;
 const LOCATOR_PORT: u32 = 0x11;
 const TFTP_PORT: u32 = 0x12;
 const IPA_PORT: u32 = 0x13;
+/// our SSCTL client port (the "subsystem up" events, ssctl.rs)
+const SSCTL_PORT: u32 = 0x25;
 const FIRST_TRANSFER_PORT: u32 = 0x100;
 /// (service, version, instance, our port); the IPA server is announced only once the kernel runs IPA
 const SERVICES: [(u32, u32, u32, u32); 4] = [
@@ -120,6 +123,9 @@ pub struct Modem {
     clients: Vec<Client>,
     /// the nodes whose HELLO we answered (the modem, the ADSP)
     hello_seen: Vec<u32>,
+    /// the SSCTL servers (node, port): the modem's, the ADSP's
+    ssctl: [Option<(u32, u32)>; 2],
+    ssctl_txn: u16,
     online_sent: bool,
     plmn_asked: Option<(u16, u16)>,
     hangup_pending: bool,
@@ -151,6 +157,8 @@ impl Modem {
             next_port: FIRST_TRANSFER_PORT,
             clients: Vec::new(),
             hello_seen: Vec::new(),
+            ssctl: [None; 2],
+            ssctl_txn: 0,
             online_sent: false,
             plmn_asked: None,
             hangup_pending: false,
@@ -289,6 +297,32 @@ impl Modem {
             }
             _ => {}
         }
+    }
+
+    /// A processor's SSCTL server appeared. Once both are known, tell each that the other is up, in Linux's order
+    /// (sysmon: the running modem hears of the ADSP, then the ADSP gets the replay of the modem). An ADSP restart
+    /// re-announces its server and so sends both again.
+    fn ssctl_up(&mut self, p: &mut dyn Platform, s: Server) {
+        let k = match (s.instance & 0xff, s.instance >> 8) {
+            (ssctl::VERSION, ssctl::MODEM) => 0,
+            (ssctl::VERSION, ssctl::ADSP) => 1,
+            _ => return,
+        };
+        self.ssctl[k] = Some((s.node, s.port));
+        let [Some(modem), Some(adsp)] = self.ssctl else {
+            return;
+        };
+        for (dst, name) in [(modem, "adsp"), (adsp, "modem")] {
+            self.ssctl_txn = self.ssctl_txn.wrapping_add(1).max(1);
+            let mut b = qmi::Builder::new(qmi::REQUEST, self.ssctl_txn, ssctl::SUBSYS_EVENT_REQ);
+            for (t, v) in ssctl::event_tlvs(name) {
+                b = b.tlv(t, &v);
+            }
+            self.send(p, qrtr::TYPE_DATA, SSCTL_PORT, dst, &b.finish());
+        }
+        p.log(format_args!(
+            "ssctl: told the modem \"adsp up\" and the adsp \"modem up\""
+        ));
     }
 
     /// INIT_DRIVER to the modem's IPA server: true once sent.
@@ -475,6 +509,9 @@ impl Modem {
                     return;
                 }
                 self.servers.push(s);
+                if service == ssctl::SERVICE {
+                    self.ssctl_up(p, s);
+                }
                 p.log(format_args!(
                     "qrtr: server {service} v{} i{} at {node}:{port}",
                     instance & 0xff,
@@ -548,6 +585,20 @@ impl Modem {
                     ));
                 }
                 self.send(p, qrtr::TYPE_DATA, h.dst_port, from, &resp);
+            }
+            SSCTL_PORT => {
+                let Some(m) = qmi::Msg::parse(payload) else {
+                    return;
+                };
+                let (who, what) = if h.src_node == MODEM_NODE {
+                    ("modem", "adsp")
+                } else {
+                    ("adsp", "modem")
+                };
+                p.log(format_args!(
+                    "ssctl: the {who} took \"{what} up\" -> {:?}",
+                    m.result().unwrap_or(Err(u16::MAX))
+                ));
             }
             TFTP_PORT => match tftp::request(payload, from, self.next_port) {
                 tftp::Action::Reply(r) => {
@@ -946,6 +997,68 @@ mod tests {
         m.handle(&mut f, &adsp(qrtr::TYPE_DATA, 0x4001, LOCATOR_PORT, &q));
         assert_eq!(*f.nodes.last().unwrap(), 5);
         assert_eq!(reply(&f).result(), Some(Ok(())));
+    }
+
+    // C6: once both SSCTL servers are known, the modem hears "adsp up" and the ADSP "modem up" (Linux sysmon)
+    #[test]
+    fn subsystems_hear_each_other_is_up() {
+        let (mut m, mut f) = (modem(), fake());
+        let ssctl = |node: u32, instance: u32, port: u32| {
+            let h = Header {
+                ty: qrtr::TYPE_NEW_SERVER,
+                src_node: node,
+                src_port: PORT_CTRL,
+                dst_node: NODE,
+                dst_port: PORT_CTRL,
+                ..Default::default()
+            };
+            let w = [
+                ssctl::SERVICE,
+                qrtr::instance_word(ssctl::VERSION, instance),
+                node,
+                port,
+            ];
+            qrtr::encode(&h, &qrtr::ctrl(qrtr::TYPE_NEW_SERVER, w))
+        };
+        m.handle(&mut f, &ssctl(0, ssctl::MODEM, 4));
+        assert!(f.sent.is_empty()); // the ADSP isn't up yet
+        m.handle(&mut f, &ssctl(5, ssctl::ADSP, 5));
+        assert_eq!(f.sent.len(), 2);
+        for (pkt, (node, port, name)) in f
+            .sent
+            .iter()
+            .zip([(0, 4, &b"\x04adsp"[..]), (5, 5, &b"\x05modem"[..])])
+        {
+            let (h, p) = qrtr::decode(pkt).unwrap();
+            assert_eq!(
+                (h.dst_node, h.dst_port, h.src_port),
+                (node, port, SSCTL_PORT)
+            );
+            let q = qmi::Msg::parse(p).unwrap();
+            assert_eq!((q.ty, q.id), (qmi::REQUEST, ssctl::SUBSYS_EVENT_REQ));
+            assert_eq!(q.tlv(0x01), Some(name));
+            assert_eq!((q.u32(0x02), q.u32(0x10)), (Some(1), Some(0)));
+        }
+        assert_eq!(f.nodes, [0, 5]);
+        // the answer is logged
+        let txn = qmi::Msg::parse(qrtr::decode(&f.sent[1]).unwrap().1)
+            .unwrap()
+            .txn;
+        let h = Header {
+            ty: qrtr::TYPE_DATA,
+            src_node: 5,
+            src_port: 5,
+            dst_node: NODE,
+            dst_port: SSCTL_PORT,
+            ..Default::default()
+        };
+        let r = ok(txn, ssctl::SUBSYS_EVENT_REQ).finish();
+        m.handle(&mut f, &qrtr::encode(&h, &r));
+        assert!(
+            f.logs
+                .iter()
+                .any(|l| l.contains("adsp took \"modem up\" -> Ok"))
+        );
     }
 
     // the C1 sequence (rmtfs.log 2026-11-08): open fs1, alloc 2 MB, read sector 1 x 1 to +0x200

@@ -47,9 +47,12 @@ const BCLK_HZ: u32 = 6_144_000; // 48 kHz x 8 slots x 16 bits
 /// VoiceMMode1: our APR port for the voice sessions, and the modem's session name
 const VOICE_PATH: u16 = 6;
 const VOICE_SESSION: &[u8] = b"11C05000";
-/// the C1 UCM's VoiceMMode1 topologies (TX, RX)
-const TOPOLOGY: (u32, u32) = (0x1000_fffc, 0x1001_0f87);
-const ACK_TIMEOUT_MS: u64 = 1000;
+/// the ADSP's built-in voice topologies (TX: single-mic echo cancellation + noise suppression, RX: default), the voice
+/// driver's defaults. C1's UCM ids (0x1000fffc, 0x10010f87) need the ACDB calibration loaded: without it the CVP's
+/// topology commit failed (status 1) and the session was gone (C6 2026-11-09).
+const TOPOLOGY: (u32, u32) = (0x0001_0f71, 0x0001_0f77);
+/// Linux waits 3 s for an AFE answer; a voice start can take a while too
+const ACK_TIMEOUT_MS: u64 = 3000;
 const CORE_TRIES: u32 = 30;
 
 /// One APR command packet (sent with src_svc = dest_svc = `svc`, as Linux's apr_send_pkt).
@@ -499,6 +502,10 @@ impl Audio {
             self.failed(log);
             return;
         }
+        log(format_args!(
+            "apr: {:?} ok",
+            current.unwrap_or(Cmd::CoreReady)
+        ));
         match current {
             Some(Cmd::MvmCreate) => self.mvm = r.src_port,
             Some(Cmd::CvpCreate) => self.cvp = r.src_port,
@@ -566,8 +573,8 @@ mod tests {
         assert_eq!(
             cvp_create(),
             hex(
-                "50 02 40 00 0b 05 06 00 0b 04 00 00 00 00 00 00 69 31 01 00 02 00 01 90 fc ff 00 10 10 90 87 0f \
-                 01 10 5e 13 01 00 7c 0f 01 00 ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
+                "50 02 40 00 0b 05 06 00 0b 04 00 00 00 00 00 00 69 31 01 00 02 00 01 90 71 0f 01 00 10 90 77 0f \
+                 01 00 5e 13 01 00 7c 0f 01 00 ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"
             )
         );
         assert_eq!(
@@ -662,7 +669,10 @@ mod tests {
         assert_eq!(&stop_ops[..3], &[MVM_STOP, MVM_DETACH, CVP_DISABLE]);
         assert_eq!(codecs, [true, false]);
         assert_eq!((a.mvm, a.cvp), (0, 0));
-        assert!(a.idle() && logs.is_empty(), "{logs:?}");
+        assert!(
+            a.idle() && logs.iter().all(|l| l.ends_with(" ok")),
+            "{logs:?}"
+        );
     }
 
     #[test]
@@ -687,8 +697,8 @@ mod tests {
         a.start();
         a.at = 1; // past the core check
         assert!(matches!(a.poll(0, &mut log), Out::Send(_)));
-        assert_eq!(a.poll(500, &mut log), Out::Nothing);
-        assert!(matches!(a.poll(1000, &mut log), Out::Send(_)));
+        assert_eq!(a.poll(2000, &mut log), Out::Nothing);
+        assert!(matches!(a.poll(3000, &mut log), Out::Send(_)));
         assert_eq!((a.at, a.failures), (2, 1));
     }
 }
