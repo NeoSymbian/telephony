@@ -129,6 +129,10 @@ pub struct Modem {
     online_sent: bool,
     plmn_asked: Option<(u16, u16)>,
     hangup_pending: bool,
+    /// the call watchdog: the (id, state) tick last saw, since when (ms), and when END was last tried
+    call_seen: (u8, u8),
+    call_since: u64,
+    hangup_at: u64,
     last_poll: u64,
     /// NAS circuit-switched attach, for the log
     cs: u8,
@@ -162,6 +166,9 @@ impl Modem {
             online_sent: false,
             plmn_asked: None,
             hangup_pending: false,
+            call_seen: (0, 0),
+            call_since: 0,
+            hangup_at: 0,
             last_poll: 0,
             cs: 0,
             selection_sent: false,
@@ -369,6 +376,7 @@ impl Modem {
 
     /// The periodic work: NAS serving system and signal every 30 s. `now_ms` is any monotonic clock.
     pub fn tick(&mut self, p: &mut dyn Platform, now_ms: u64) {
+        self.call_watch(p, now_ms);
         if self.ipa_init_due && now_ms.saturating_sub(self.ipa_init_at) >= 2000 {
             self.ipa_init_at = now_ms; // every 2 s until it goes out (a refused send takes up to 2 s)
             self.ipa_init_due = !self.init_driver(p);
@@ -379,6 +387,34 @@ impl Modem {
         self.last_poll = now_ms;
         self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
         self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
+    }
+
+    /// The call can't stick (C6 2026-11-09: a hangup that never reached the modem left it "dialling" for good, and
+    /// every redial got -14): an END not yet sent goes again each second; a call stuck in a passing state ends here
+    /// (disconnecting 5 s, dialling 30 s without a word from the modem).
+    fn call_watch(&mut self, p: &mut dyn Platform, now_ms: u64) {
+        let c = self.status.call;
+        if (c.id, c.state) != self.call_seen {
+            self.call_seen = (c.id, c.state);
+            self.call_since = now_ms;
+        }
+        if self.hangup_pending && c.id != 0 && now_ms.saturating_sub(self.hangup_at) >= 1000 {
+            self.hangup_at = now_ms;
+            let _ = self.hangup(p);
+        }
+        let limit = match c.state {
+            call::DISCONNECTING => 5_000,
+            call::ORIGINATION | call::CC_IN_PROGRESS | call::SETUP => 30_000,
+            _ => return,
+        };
+        if now_ms.saturating_sub(self.call_since) > limit {
+            p.log(format_args!(
+                "voice: call {} stuck in state {}: ended here",
+                c.id, c.state
+            ));
+            self.status.call.state = call::END;
+            self.hangup_pending = false;
+        }
     }
 
     /// The modem died (SMP2P fatal): nothing it reported holds any more. The UI shows "No service".
@@ -426,20 +462,17 @@ impl Modem {
             .ok_or(KERR_NOT_READY)
     }
 
-    /// End, reject or cancel the call (modem_ipc::op::HANGUP). A dial the modem hasn't numbered yet ends as soon as
-    /// it has its id.
+    /// End, reject or cancel the call (modem_ipc::op::HANGUP). It always ends: the call shows "disconnecting" at
+    /// once; an END that can't go out yet (no call id, or the modem takes nothing) is retried by `tick`, whose
+    /// watchdog ends the call if the modem never confirms.
     pub fn hangup(&mut self, p: &mut dyn Platform) -> Result<(), i32> {
         let c = self.status.call;
         if matches!(c.state, call::NONE | call::END) {
             return Err(KERR_NOT_READY);
         }
-        if c.id == 0 {
-            self.hangup_pending = true;
-            return Ok(());
-        }
-        self.request(p, VOICE, voice::END, &[(0x01, &[c.id])])
-            .then_some(())
-            .ok_or(KERR_NOT_READY)
+        self.status.call.state = call::DISCONNECTING;
+        self.hangup_pending = c.id == 0 || !self.request(p, VOICE, voice::END, &[(0x01, &[c.id])]);
+        Ok(())
     }
 
     /// A keypad tone during a connected call (modem_ipc::op::DTMF): `Some(key)` starts it (`0-9`, `*`, `#`), `None`
@@ -1377,6 +1410,61 @@ mod tests {
         let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
         let a = qmi::Msg::parse(pay).unwrap();
         assert_eq!((a.id, a.tlv(1)), (voice::ANSWER, Some(&[2u8][..])));
+    }
+
+    // C6 2026-11-09: a hangup that couldn't reach the modem left the call "dialling" forever and every redial got
+    // -14. Now a hangup always ends the call: END is retried each second, and the watchdog ends it after 5 s.
+    #[test]
+    fn a_hangup_the_modem_never_gets_still_ends_the_call() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        assert_eq!(m.dial(&mut f, "+37400000012"), Ok(()));
+        let (_, _, _, txn) = req(f.sent.last().unwrap());
+        let dial_ok = ok(txn, voice::DIAL).u8(0x10, 1).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 50, 0x23, &dial_ok));
+        m.tick(&mut f, 1000);
+        f.refuse = usize::MAX; // the modem takes nothing
+        assert_eq!(m.hangup(&mut f), Ok(()));
+        assert_eq!(m.status.call.state, call::DISCONNECTING);
+        m.tick(&mut f, 3000);
+        assert_eq!(m.status.call.state, call::DISCONNECTING);
+        m.tick(&mut f, 8100); // 5 s after tick first saw it disconnecting
+        assert_eq!(m.status.call.state, call::END);
+        f.refuse = 0;
+        assert_eq!(m.dial(&mut f, "+37400000012"), Ok(()));
+    }
+
+    // the END that couldn't go out goes out on a later tick
+    #[test]
+    fn a_refused_end_is_sent_again() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        m.dial(&mut f, "+37400000012").unwrap();
+        let (_, _, _, txn) = req(f.sent.last().unwrap());
+        let dial_ok = ok(txn, voice::DIAL).u8(0x10, 1).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 50, 0x23, &dial_ok));
+        f.refuse = 1;
+        m.hangup(&mut f).unwrap();
+        let n = f.sent.len();
+        m.tick(&mut f, 1500);
+        assert_eq!(f.sent.len(), n + 1);
+        assert_eq!(req(f.sent.last().unwrap()).2, voice::END);
+        m.tick(&mut f, 1600);
+        assert_eq!(f.sent.len(), n + 1); // sent: no more retries
+    }
+
+    // a dial the modem never reports on ends after 30 s
+    #[test]
+    fn a_dial_that_goes_nowhere_ends() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        m.dial(&mut f, "+37400000012").unwrap();
+        m.tick(&mut f, 100);
+        m.tick(&mut f, 20_000);
+        assert_eq!(m.status.call.state, call::ORIGINATION);
+        m.tick(&mut f, 31_000);
+        assert_eq!(m.status.call.state, call::END);
+        assert!(f.logs.iter().any(|l| l.contains("ended here")));
     }
 
     // C6 2026-11-09: INIT_DRIVER refused during the modem's start-up burst was dropped, and LTE asserted

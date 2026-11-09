@@ -20,6 +20,7 @@ use e32::server::{self, Message, Server, Service};
 use e32::sys::err;
 use e32::sys::ipc::TVersion;
 use e32::{dprintln, time};
+use modem_proto::apr::Mode;
 use modem_proto::modem_ipc::{self, Status, op};
 use modem_proto::{Modem, Platform};
 
@@ -42,6 +43,8 @@ const RUNNING: u32 = 8;
 const MODEM_NODE: u32 = 0;
 const FATAL: u32 = 1;
 const BOOT_TIMEOUT_MS: u64 = 60_000;
+/// the daemon's step period
+const LOOP_US: i32 = 10_000;
 const STATUS_LOG_MS: u64 = 30_000;
 
 #[repr(C)]
@@ -82,7 +85,7 @@ impl Platform for Hal {
         for _ in 0..10 {
             let r = hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8);
             match r {
-                NOT_READY => time::sleep(200),
+                NOT_READY => time::sleep(20_000), // e32 sleeps in microseconds: 20 ms, at most 200 ms in all
                 r if r < 0 => return Err(r),
                 _ => return Ok(()),
             }
@@ -152,8 +155,6 @@ struct Daemon {
     adsp: adsp::Adsp,
     /// the call's audio path and the in-call buttons' settings (C6)
     audio: adsp::CallAudio,
-    /// the call state the audio last followed
-    audio_call: u8,
     /// a keypad tone ends here (ms): one tap = one 200 ms tone
     dtmf_stop: Option<u64>,
 }
@@ -264,7 +265,7 @@ impl Daemon {
 
     /// An audio setting to the kernel's codecs while the call's audio runs (else it waits for the next call).
     fn apply(&mut self, op: u32, arg: u32) -> i32 {
-        if !self.audio.apr.running {
+        if self.audio.apr.is() != Mode::Call {
             return err::KERR_NONE;
         }
         let r = adsp::audio(op, arg);
@@ -272,32 +273,32 @@ impl Daemon {
     }
 
     /// Dev tools' audio test (no call): 1 loudspeaker, 2 earpiece, the mic looped back to the amps; 0 stops it.
+    /// Pressing the other route while it runs only switches the amps.
     fn audio_test(&mut self, what: i32) -> i32 {
         if !matches!(self.adsp, adsp::Adsp::Up) {
             return NOT_READY;
         }
-        if self.audio.apr.running && !self.audio.apr.testing {
-            return err::KERR_IN_USE; // a call's audio
+        if self.talking() {
+            return err::KERR_IN_USE;
         }
-        dprintln!(
-            "[modemd] audio test {}",
-            ["stop", "loudspeaker", "earpiece"]
-                .get(what as usize)
-                .unwrap_or(&"?")
-        );
-        match what {
-            0 if self.audio.apr.testing => self.audio.apr.stop(),
-            0 => {}
-            1 | 2 => {
-                if self.audio.apr.testing {
-                    return err::KERR_IN_USE;
-                }
-                self.audio.speaker = what == 1;
-                self.audio.apr.test();
-            }
+        let test = match what {
+            0 => None,
+            1 | 2 => Some(what == 1),
             _ => return err::KERR_ARGUMENT,
+        };
+        dprintln!("[modemd] audio test {:?} (loudspeaker)", test);
+        self.audio.test = test;
+        if let (Some(spk), Mode::Test) = (test, self.audio.apr.is()) {
+            adsp::audio(3, spk as u32);
         }
         err::KERR_NONE
+    }
+
+    /// A call is connected (its audio runs or is wanted).
+    fn talking(&self) -> bool {
+        self.modem
+            .as_ref()
+            .is_some_and(|m| m.status.call.state == modem_ipc::call::CONVERSATION)
     }
 
     fn boot(&mut self) {
@@ -346,19 +347,24 @@ impl Daemon {
         while let Some(n) = adsp::recv(adsp::RING_QRTR, buf) {
             modem.handle(&mut Hal, &buf[..n]);
         }
-        // the call's audio follows the call: on once connected (the ADSP up), off when it ends
-        let call_state = modem.status.call.state;
-        if call_state != self.audio_call {
-            self.audio_call = call_state;
-            let talking = call_state == modem_ipc::call::CONVERSATION;
-            if talking && !self.audio.apr.running && matches!(self.adsp, adsp::Adsp::Up) {
-                dprintln!("[modemd] audio: call connected, starting the voice path");
-                self.audio.apr.start();
-            } else if !talking && self.audio.apr.running {
-                dprintln!("[modemd] audio: call over, stopping the voice path");
-                self.audio.apr.stop();
-            }
+        // the audio follows what is wanted now: a connected call's voice path, else the test, else nothing (the
+        // state machine finishes a running sequence first)
+        let talking = modem.status.call.state == modem_ipc::call::CONVERSATION;
+        if talking {
+            self.audio.test = None; // a call ends the test
         }
+        self.audio.apr.set(
+            match (
+                matches!(self.adsp, adsp::Adsp::Up),
+                talking,
+                self.audio.test,
+            ) {
+                (false, _, _) => Mode::Off,
+                (true, true, _) => Mode::Call,
+                (true, false, Some(_)) => Mode::Test,
+                (true, false, None) => Mode::Off,
+            },
+        );
         if matches!(self.adsp, adsp::Adsp::Up) {
             self.audio.pump(buf);
         }
@@ -573,21 +579,14 @@ fn main() -> i32 {
         ipa_up: false,
         adsp: adsp::Adsp::Idle,
         audio: adsp::CallAudio::new(),
-        audio_call: 0,
         dtmf_stop: None,
     };
     rt::block_on(async {
         let mut receive = pin!(server.receive());
         loop {
-            // fast while the ADSP loads (its steps) or a call's audio runs; else every 2 s
-            let fast = d.audio.busy() || d.audio_call == modem_ipc::call::CONVERSATION;
-            let ms = if matches!(d.phase, Phase::Adsp) || matches!(d.phase, Phase::Running) && fast
-            {
-                20
-            } else {
-                2000
-            };
-            match rt::select(receive.as_mut(), time::delay(ms)).await {
+            // one step every 10 ms: the rings are polled (e32 delays are in microseconds; the old "20 ms / 2 s"
+            // were 20 us / 2 ms, C6 2026-11-09)
+            match rt::select(receive.as_mut(), time::delay(LOOP_US)).await {
                 Either::Left(Ok(msg)) => {
                     receive.set(server.receive());
                     let _ = server::dispatch(&mut d, msg);

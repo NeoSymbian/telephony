@@ -9,6 +9,7 @@ use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 use e32::{dprintln, time};
+use modem_proto::apr::Mode;
 
 const ADSP_LOAD: i32 = 0x4e14;
 const ADSP_STATE: i32 = 0x4e15;
@@ -185,7 +186,7 @@ impl Adsp {
         }
     }
 
-    /// Loading: the daemon polls fast.
+    /// Not up or failed yet: loading or booting.
     pub fn busy(&self) -> bool {
         matches!(self, Adsp::Idle | Adsp::Loading(_) | Adsp::Booting(_))
     }
@@ -277,7 +278,7 @@ pub fn send(ring: u32, data: &[u8]) -> Result<(), i32> {
             },
         );
         match r {
-            NOT_READY => time::sleep(50),
+            NOT_READY => time::sleep(5_000), // e32 sleeps in microseconds: 5 ms
             r if r < 0 => return Err(r),
             _ => return Ok(()),
         }
@@ -301,12 +302,14 @@ pub fn audio(op: u32, arg: u32) -> i32 {
     .0
 }
 
-/// The call's audio (C6): the APR sequence (modem_proto::apr) with its codecs step, and the buttons' settings.
+/// The audio (C6): the APR state machine (modem_proto::apr) with its codecs step, the call buttons' settings (kept
+/// across calls), and Dev tools' test (Some(loudspeaker) while it is wanted; its route never touches the call's).
 pub struct CallAudio {
     pub apr: modem_proto::apr::Audio,
     pub muted: bool,
     pub speaker: bool,
     pub volume: u8,
+    pub test: Option<bool>,
 }
 
 impl CallAudio {
@@ -316,6 +319,7 @@ impl CallAudio {
             muted: false,
             speaker: false,
             volume: 10,
+            test: None,
         }
     }
 
@@ -337,7 +341,7 @@ impl CallAudio {
                     let r = if on {
                         audio(4, self.volume as u32);
                         audio(5, self.muted as u32);
-                        audio(1, self.speaker as u32)
+                        audio(1, self.loudspeaker() as u32)
                     } else {
                         audio(2, 0)
                     };
@@ -353,14 +357,18 @@ impl CallAudio {
         }
     }
 
-    /// The sequence is mid-way: the daemon polls fast.
-    pub fn busy(&self) -> bool {
-        !self.apr.idle()
+    /// The route the codecs take: the test's while the test runs, else the call's Speaker button.
+    pub fn loudspeaker(&self) -> bool {
+        match self.apr.is() {
+            Mode::Test => self.test.unwrap_or(true),
+            _ => self.speaker,
+        }
     }
 
+    /// What NeoModem reports: `on` only for a call's audio (the volume keys act on it), never the test.
     pub fn status(&self) -> modem_proto::modem_ipc::Audio {
         modem_proto::modem_ipc::Audio {
-            on: self.apr.running,
+            on: self.apr.is() == Mode::Call,
             muted: self.muted,
             speaker: self.speaker,
             volume: self.volume,
