@@ -298,7 +298,7 @@ impl Daemon {
     fn talking(&self) -> bool {
         self.modem
             .as_ref()
-            .is_some_and(|m| m.status.call.state == modem_ipc::call::CONVERSATION)
+            .is_some_and(|m| call_audio(m.status.call.state, self.audio.apr.is()))
     }
 
     fn boot(&mut self) {
@@ -349,7 +349,7 @@ impl Daemon {
         }
         // the audio follows what is wanted now: a connected call's voice path, else the test, else nothing (the
         // state machine finishes a running sequence first)
-        let talking = modem.status.call.state == modem_ipc::call::CONVERSATION;
+        let talking = call_audio(modem.status.call.state, self.audio.apr.is());
         if talking {
             self.audio.test = None; // a call ends the test
         }
@@ -556,6 +556,15 @@ impl Service for Daemon {
     fn disconnect(&mut self, _: ()) -> ControlFlow<()> {
         ControlFlow::Continue(())
     }
+}
+
+/// The call's voice path runs from "connected" until the modem says the call ended (END/NONE), through hold and
+/// disconnecting, as Linux (it stops on "terminated"). Stopping it at "disconnecting" overlapped the modem's own
+/// teardown with the ADSP: the ADSP stopped answering and the modem stayed on 3G (C6 2026-11-09).
+fn call_audio(state: u8, is: Mode) -> bool {
+    use modem_ipc::call;
+    state == call::CONVERSATION
+        || (is == Mode::Call && matches!(state, call::HOLD | call::DISCONNECTING))
 }
 
 fn main() -> i32 {
