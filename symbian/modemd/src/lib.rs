@@ -129,8 +129,8 @@ enum Phase {
     Ipa,
     /// reading partition i (one per loop step)
     Read(usize),
-    /// the ADSP loads and comes up before the modem boots, Linux's order (C6: the modem joins the ADSP's voice
-    /// session only if the ADSP was there first, under test 2026-11-09)
+    /// the ADSP loads and comes up before the modem boots (C6): loading it during the modem's start-up lost the
+    /// modem's announcements, and the modem hears "adsp up" (SSCTL) as soon as both run
     Adsp,
     /// the kernel boots the modem; since t0
     Wait(u64),

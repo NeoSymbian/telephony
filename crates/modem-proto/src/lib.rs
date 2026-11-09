@@ -620,8 +620,8 @@ impl Modem {
                 self.send(p, qrtr::TYPE_DATA, h.dst_port, from, &resp);
             }
             SSCTL_PORT => {
-                let Some(m) = qmi::Msg::parse(payload) else {
-                    return;
+                let Some(m) = qmi::Msg::parse(payload).filter(|m| m.ty == qmi::RESPONSE) else {
+                    return; // the answers only (the processors send other messages on this port too)
                 };
                 let (who, what) = if h.src_node == MODEM_NODE {
                     ("modem", "adsp")
