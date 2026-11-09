@@ -331,27 +331,35 @@ fn ipa_firmware() -> Result<(Vec<u8>, usize), ext4ro::Error> {
     if phoff + 32 * phnum > mdt.len() {
         return Err(ext4ro::Error::Unsupported);
     }
+    // (p_type, p_offset, p_filesz, p_flags) of program header i
     let ph = |i: usize| {
+        let at = phoff + 32 * i;
         (
-            word(&mdt, phoff + 32 * i + 4),
-            word(&mdt, phoff + 32 * i + 16),
+            word(&mdt, at),
+            word(&mdt, at + 4),
+            word(&mdt, at + 16),
+            word(&mdt, at + 24),
         )
-    }; // p_offset, p_filesz
+    };
+    // only PT_LOAD segments that aren't the hash: those come from .bNN at their p_offset, past the .mdt. The hash
+    // segment's p_offset falls inside the .mdt's bytes (its copy is packed there); writing .b01 over it corrupted
+    // the metadata TrustZone checks (C5b: init_image refused, -0x300045).
+    let loadable = |i: usize| ph(i).0 == 1 && ph(i).3 & (7 << 24) != 2 << 24 && ph(i).2 > 0;
     let len = (0..phnum)
-        .map(|i| ph(i).0 + ph(i).1)
+        .filter(|&i| loadable(i))
+        .map(|i| ph(i).1 + ph(i).2)
         .fold(mdt.len(), usize::max);
     let mut image = vec![0u8; len];
     image[..mdt.len()].copy_from_slice(&mdt);
-    for i in 0..phnum {
-        let (off, size) = ph(i);
-        if size == 0 {
-            continue;
+    for i in (0..phnum).filter(|&i| loadable(i)) {
+        let (_, off, size, _) = ph(i);
+        if off < mdt.len() {
+            return Err(ext4ro::Error::Unsupported); // would overwrite the metadata
         }
-        if let Ok(seg) = fs.find(&alloc::format!("firmware/ipa_fws.b{i:02}")) {
-            let seg = fs.read(&seg)?;
-            let n = seg.len().min(size);
-            image[off..off + n].copy_from_slice(&seg[..n]);
-        }
+        let seg = fs.find(&alloc::format!("firmware/ipa_fws.b{i:02}"))?;
+        let seg = fs.read(&seg)?;
+        let n = seg.len().min(size);
+        image[off..off + n].copy_from_slice(&seg[..n]);
     }
     Ok((image, mdt.len()))
 }
