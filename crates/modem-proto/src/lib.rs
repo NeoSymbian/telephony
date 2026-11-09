@@ -137,7 +137,17 @@ pub struct Modem {
     /// NAS circuit-switched attach, for the log
     cs: u8,
     selection_sent: bool,
+    /// essential packets the transport refused, sent again by `tick` in order
+    outbox: Vec<Unsent>,
+    outbox_at: u64,
 }
+
+/// (type, our port, destination, payload)
+type Unsent = (u32, u32, (u32, u32), Vec<u8>);
+/// essential packets kept for a retry at most; an older one gives way (logged)
+const OUTBOX: usize = 16;
+/// how often `tick` retries them (a refused send can take ~200 ms in the kernel)
+const OUTBOX_RETRY_MS: u64 = 1000;
 
 /// "350000000000012" -> "35xxxxxxxxxxx12": never log a whole IMEI.
 pub fn mask(id: &str) -> String {
@@ -172,6 +182,8 @@ impl Modem {
             last_poll: 0,
             cs: 0,
             selection_sent: false,
+            outbox: Vec::new(),
+            outbox_at: 0,
             ipa_up: false,
             ipa: ipa::Handshake::default(),
             ipa_init_due: false,
@@ -210,8 +222,40 @@ impl Modem {
         true
     }
 
+    /// A packet that must arrive (flow control, control, SSCTL, the subscriptions): refused, or behind others that
+    /// were, it waits in the outbox and `tick` sends it in order. True if it went now. One lost RESUME_TX stalls
+    /// the sender's flow for good (2026-11-09 review F07).
+    fn send_must(
+        &mut self,
+        p: &mut dyn Platform,
+        ty: u32,
+        src_port: u32,
+        dst: (u32, u32),
+        payload: &[u8],
+    ) -> bool {
+        if self.outbox.is_empty() && self.send(p, ty, src_port, dst, payload) {
+            return true;
+        }
+        if self.outbox.len() >= OUTBOX {
+            let (ty, ..) = self.outbox.remove(0);
+            p.log(format_args!("qrtr: outbox full: type {ty} dropped"));
+        }
+        self.outbox.push((ty, src_port, dst, payload.to_vec()));
+        false
+    }
+
+    /// The outbox, oldest first, until the transport refuses one.
+    fn flush(&mut self, p: &mut dyn Platform) {
+        while let Some((ty, port, dst, data)) = self.outbox.first().cloned() {
+            if !self.send(p, ty, port, dst, &data) {
+                return;
+            }
+            self.outbox.remove(0);
+        }
+    }
+
     fn ctrl(&mut self, p: &mut dyn Platform, ty: u32, dst: (u32, u32), words: [u32; 4]) {
-        self.send(p, ty, PORT_CTRL, dst, &qrtr::ctrl(ty, words));
+        self.send_must(p, ty, PORT_CTRL, dst, &qrtr::ctrl(ty, words));
     }
 
     /// Our servers: IPA's only while the kernel runs IPA.
@@ -248,6 +292,28 @@ impl Modem {
         id: u16,
         tlvs: &[(u8, &[u8])],
     ) -> bool {
+        self.qmi_request(p, service, id, tlvs, false)
+    }
+
+    /// A request that must arrive (`send_must`): true once sent or queued, false only without the service.
+    fn request_must(
+        &mut self,
+        p: &mut dyn Platform,
+        service: u32,
+        id: u16,
+        tlvs: &[(u8, &[u8])],
+    ) -> bool {
+        self.qmi_request(p, service, id, tlvs, true)
+    }
+
+    fn qmi_request(
+        &mut self,
+        p: &mut dyn Platform,
+        service: u32,
+        id: u16,
+        tlvs: &[(u8, &[u8])],
+        must: bool,
+    ) -> bool {
         let Some(c) = self.clients.iter_mut().find(|c| c.service == service) else {
             return false;
         };
@@ -261,6 +327,10 @@ impl Modem {
         }
         c.pending.push((c.txn, id));
         let (port, dst) = (c.port, c.dst);
+        if must {
+            self.send_must(p, qrtr::TYPE_DATA, port, dst, &b.finish());
+            return true;
+        }
         self.send(p, qrtr::TYPE_DATA, port, dst, &b.finish())
     }
 
@@ -287,15 +357,15 @@ impl Modem {
                 self.maybe_online(p);
             }
             UIM => {
-                self.request(p, UIM, UIM_GET_CARD_STATUS, &[]);
+                self.request_must(p, UIM, UIM_GET_CARD_STATUS, &[]);
             }
             NAS => {
-                self.request(p, NAS, nas::REGISTER_INDICATIONS, &nas::INDICATIONS);
+                self.request_must(p, NAS, nas::REGISTER_INDICATIONS, &nas::INDICATIONS);
                 self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
                 self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
             }
             VOICE => {
-                self.request(p, VOICE, voice::INDICATION_REGISTER, &voice::INDICATIONS);
+                self.request_must(p, VOICE, voice::INDICATION_REGISTER, &voice::INDICATIONS);
             }
             _ if self.ipa_up => {
                 // the modem's IPA server (0x31 instance 2): where IPA's tables are. It must arrive: without it the
@@ -319,16 +389,18 @@ impl Modem {
         let [Some(modem), Some(adsp)] = self.ssctl else {
             return;
         };
+        let mut now = true;
         for (dst, name) in [(modem, "adsp"), (adsp, "modem")] {
             self.ssctl_txn = self.ssctl_txn.wrapping_add(1).max(1);
             let mut b = qmi::Builder::new(qmi::REQUEST, self.ssctl_txn, ssctl::SUBSYS_EVENT_REQ);
             for (t, v) in ssctl::event_tlvs(name) {
                 b = b.tlv(t, &v);
             }
-            self.send(p, qrtr::TYPE_DATA, SSCTL_PORT, dst, &b.finish());
+            now &= self.send_must(p, qrtr::TYPE_DATA, SSCTL_PORT, dst, &b.finish());
         }
         p.log(format_args!(
-            "ssctl: told the modem \"adsp up\" and the adsp \"modem up\""
+            "ssctl: {} the modem \"adsp up\" and the adsp \"modem up\"",
+            if now { "told" } else { "queued for" }
         ));
     }
 
@@ -376,6 +448,10 @@ impl Modem {
 
     /// The periodic work: NAS serving system and signal every 30 s. `now_ms` is any monotonic clock.
     pub fn tick(&mut self, p: &mut dyn Platform, now_ms: u64) {
+        if !self.outbox.is_empty() && now_ms.saturating_sub(self.outbox_at) >= OUTBOX_RETRY_MS {
+            self.outbox_at = now_ms;
+            self.flush(p);
+        }
         self.call_watch(p, now_ms);
         if self.ipa_init_due && now_ms.saturating_sub(self.ipa_init_at) >= 2000 {
             self.ipa_init_at = now_ms; // every 2 s until it goes out (a refused send takes up to 2 s)
@@ -487,7 +563,7 @@ impl Modem {
                 self.request(p, VOICE, voice::START_CONT_DTMF, &[(0x01, &[c.id, k])])
             }
             Some(_) => return Err(KERR_ARGUMENT),
-            None => self.request(p, VOICE, voice::STOP_CONT_DTMF, &[(0x01, &[c.id])]),
+            None => self.request_must(p, VOICE, voice::STOP_CONT_DTMF, &[(0x01, &[c.id])]),
         };
         sent.then_some(()).ok_or(KERR_NOT_READY)
     }
@@ -512,7 +588,7 @@ impl Modem {
         // Every type, control included: unconfirmed NEW_SERVERs stalled the modem's announcements, and DMS or UIM
         // never arrived (C5, 2026-11-09). Linux confirms whatever a socket receives.
         if h.confirm_rx != 0 && h.ty != qrtr::TYPE_RESUME_TX {
-            self.send(
+            self.send_must(
                 p,
                 qrtr::TYPE_RESUME_TX,
                 h.dst_port,
@@ -1036,23 +1112,7 @@ mod tests {
     #[test]
     fn subsystems_hear_each_other_is_up() {
         let (mut m, mut f) = (modem(), fake());
-        let ssctl = |node: u32, instance: u32, port: u32| {
-            let h = Header {
-                ty: qrtr::TYPE_NEW_SERVER,
-                src_node: node,
-                src_port: PORT_CTRL,
-                dst_node: NODE,
-                dst_port: PORT_CTRL,
-                ..Default::default()
-            };
-            let w = [
-                ssctl::SERVICE,
-                qrtr::instance_word(ssctl::VERSION, instance),
-                node,
-                port,
-            ];
-            qrtr::encode(&h, &qrtr::ctrl(qrtr::TYPE_NEW_SERVER, w))
-        };
+        let ssctl = ssctl_ns;
         m.handle(&mut f, &ssctl(0, ssctl::MODEM, 4));
         assert!(f.sent.is_empty()); // the ADSP isn't up yet
         m.handle(&mut f, &ssctl(5, ssctl::ADSP, 5));
@@ -1177,6 +1237,72 @@ mod tests {
         let (h, p) = qrtr::decode(&f.sent[0]).unwrap();
         assert_eq!((h.ty, h.dst_port), (qrtr::TYPE_RESUME_TX, 30));
         assert_eq!(qrtr::ctrl_words(p), Some((7, [NODE, LOCATOR_PORT, 0, 0])));
+    }
+
+    // 2026-11-09 review F07: a refused RESUME_TX goes out on a later tick, once (else the sender's flow stalls)
+    #[test]
+    fn a_refused_resume_tx_is_sent_again() {
+        let (mut m, mut f) = (modem(), fake());
+        let mut pkt = ns(15, 22);
+        pkt[16] = 1;
+        f.refuse = 1;
+        m.handle(&mut f, &pkt);
+        assert!(f.sent.is_empty());
+        m.tick(&mut f, 500); // retried at most every second
+        assert!(f.sent.is_empty());
+        m.tick(&mut f, 1000);
+        m.tick(&mut f, 2000);
+        let resumes = f
+            .sent
+            .iter()
+            .filter(|p| qrtr::decode(p).unwrap().0.ty == qrtr::TYPE_RESUME_TX)
+            .count();
+        assert_eq!(resumes, 1);
+    }
+
+    // F07: refused SSCTL events go out on tick, in order, once each, and the log doesn't claim them before
+    #[test]
+    fn refused_ssctl_events_go_out_on_tick_in_order() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ssctl_ns(0, ssctl::MODEM, 4));
+        f.refuse = 1;
+        m.handle(&mut f, &ssctl_ns(5, ssctl::ADSP, 5));
+        assert!(f.sent.is_empty()); // the second waits behind the refused first
+        assert!(f.logs.iter().any(|l| l.contains("ssctl: queued for")));
+        assert!(!f.logs.iter().any(|l| l.contains("ssctl: told")));
+        m.tick(&mut f, 1000);
+        m.tick(&mut f, 2000);
+        assert_eq!(f.nodes, [0, 5]);
+    }
+
+    // F07: the VOICE subscription is one-shot at the service's arrival: refused, it must still go (no calls without it)
+    #[test]
+    fn a_refused_voice_subscription_is_sent_again() {
+        let (mut m, mut f) = (modem(), fake());
+        f.refuse = 1;
+        m.handle(&mut f, &ns(VOICE, 50));
+        assert!(f.sent.is_empty());
+        m.tick(&mut f, 1000);
+        assert_eq!(f.sent.len(), 1);
+        assert_eq!(req(&f.sent[0]).2, voice::INDICATION_REGISTER);
+    }
+
+    fn ssctl_ns(node: u32, instance: u32, port: u32) -> Vec<u8> {
+        let h = Header {
+            ty: qrtr::TYPE_NEW_SERVER,
+            src_node: node,
+            src_port: PORT_CTRL,
+            dst_node: NODE,
+            dst_port: PORT_CTRL,
+            ..Default::default()
+        };
+        let w = [
+            ssctl::SERVICE,
+            qrtr::instance_word(ssctl::VERSION, instance),
+            node,
+            port,
+        ];
+        qrtr::encode(&h, &qrtr::ctrl(qrtr::TYPE_NEW_SERVER, w))
     }
 
     fn ns(service: u32, port: u32) -> Vec<u8> {
