@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+pub mod ipa;
 pub mod locator;
 pub mod nas;
 pub mod qmi;
@@ -38,9 +39,10 @@ const MODEM_NODE: u32 = 0;
 const RMTFS_PORT: u32 = 0x10;
 const LOCATOR_PORT: u32 = 0x11;
 const TFTP_PORT: u32 = 0x12;
+const IPA_PORT: u32 = 0x13;
 const FIRST_TRANSFER_PORT: u32 = 0x100;
-/// (service, version, instance, our port)
-const SERVICES: [(u32, u32, u32, u32); 3] = [
+/// (service, version, instance, our port); the IPA server is announced only once the kernel runs IPA
+const SERVICES: [(u32, u32, u32, u32); 4] = [
     (rmtfs::SERVICE, rmtfs::VERSION, rmtfs::INSTANCE, RMTFS_PORT),
     (
         locator::SERVICE,
@@ -49,23 +51,27 @@ const SERVICES: [(u32, u32, u32, u32); 3] = [
         LOCATOR_PORT,
     ),
     (tftp::SERVICE, tftp::VERSION, tftp::INSTANCE, TFTP_PORT),
+    (ipa::SERVICE, ipa::VERSION, ipa::INSTANCE, IPA_PORT),
 ];
 const DMS: u32 = 2;
 const UIM: u32 = 11;
 const NAS: u32 = nas::SERVICE;
 const VOICE: u32 = voice::SERVICE;
+const IPA: u32 = ipa::SERVICE;
 /// Our QMI clients: (service, our port)
-const CLIENTS: [(u32, u32); 4] = [(DMS, 0x20), (UIM, 0x21), (NAS, 0x22), (VOICE, 0x23)];
+const CLIENTS: [(u32, u32); 5] = [
+    (DMS, 0x20),
+    (UIM, 0x21),
+    (NAS, 0x22),
+    (VOICE, 0x23),
+    (IPA, 0x24),
+];
 const DMS_GET_REVISION: u16 = 0x23;
 const DMS_GET_IDS: u16 = 0x25;
 const DMS_SET_OPERATING_MODE: u16 = 0x2e;
 const UIM_GET_CARD_STATUS: u16 = 0x2f;
 /// NAS polls, as ModemManager does (indications cover the rest)
 const POLL_MS: u64 = 30_000;
-/// 2G/3G circuit-switched only (NAS system selection, until power cycle): no packet data reaches the modem's IPA path,
-/// which we don't run yet: on LTE data the modem asserts "IPA Assert: new_free_space > 0" (C5).
-/// shortcut: until IPA (docs/telephony.md C5b) drains the modem's data path; then LTE comes back.
-pub const VOICE_ONLY: bool = true;
 pub const KERR_NOT_READY: i32 = -18;
 pub const KERR_ARGUMENT: i32 = -6;
 pub const KERR_IN_USE: i32 = -14;
@@ -98,6 +104,11 @@ pub struct Modem {
     pub imei: Option<String>,
     /// The first card's state from UIM: 0 absent, 1 present, 2 error.
     pub card: Option<u8>,
+    /// The kernel runs IPA (MODEMD's HAL IpaStart succeeded): then the IPA handshake runs and LTE stays allowed.
+    /// Without it, voice-only: 2G/3G circuit-switched (NAS system selection, until power cycle), because on LTE data
+    /// the modem asserts in its IPA path ("IPA Assert: new_free_space > 0", C5).
+    pub ipa_up: bool,
+    ipa: ipa::Handshake,
     /// What NeoModem clients see (modem_ipc::op::STATUS)
     pub status: Status,
     transfers: Vec<tftp::Transfer>,
@@ -141,6 +152,8 @@ impl Modem {
             last_poll: 0,
             cs: 0,
             selection_sent: false,
+            ipa_up: false,
+            ipa: ipa::Handshake::default(),
         }
     }
 
@@ -176,8 +189,15 @@ impl Modem {
         self.send(p, ty, PORT_CTRL, dst, &qrtr::ctrl(ty, words));
     }
 
+    /// Our servers: IPA's only while the kernel runs IPA.
+    fn services(&self) -> impl Iterator<Item = (u32, u32, u32, u32)> {
+        let ipa_up = self.ipa_up;
+        SERVICES.into_iter().filter(move |s| ipa_up || s.0 != IPA)
+    }
+
     fn announce(&mut self, p: &mut dyn Platform, dst: (u32, u32)) {
-        for (service, version, instance, port) in SERVICES {
+        let services: Vec<_> = self.services().collect();
+        for (service, version, instance, port) in services {
             self.ctrl(
                 p,
                 qrtr::TYPE_NEW_SERVER,
@@ -249,10 +269,37 @@ impl Modem {
                 self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
                 self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
             }
-            _ => {
+            VOICE => {
                 self.request(p, VOICE, voice::INDICATION_REGISTER, &voice::INDICATIONS);
             }
+            _ if self.ipa_up => {
+                // the modem's IPA server (0x31 instance 2): where IPA's tables are
+                let tlvs = ipa::init_driver_tlvs();
+                let refs: Vec<(u8, &[u8])> = tlvs.iter().map(|(t, v)| (*t, v.as_slice())).collect();
+                self.request(p, IPA, ipa::INIT_DRIVER, &refs);
+            }
+            _ => {}
         }
+    }
+
+    /// IPA's INIT_COMPLETE indication, from our server to the modem's IPA server, once the handshake is in.
+    fn ipa_complete(&mut self, p: &mut dyn Platform) {
+        if !self.ipa.complete_due() {
+            return;
+        }
+        let Some(dst) = self
+            .clients
+            .iter()
+            .find(|c| c.service == IPA)
+            .map(|c| c.dst)
+        else {
+            return;
+        };
+        let ind = qmi::Builder::new(qmi::INDICATION, 1, ipa::INIT_COMPLETE)
+            .result(0)
+            .finish();
+        self.send(p, qrtr::TYPE_DATA, IPA_PORT, dst, &ind);
+        p.log(format_args!("ipa: handshake complete"));
     }
 
     /// The radio on (DMS Set Operating Mode online) once there is a SIM: ModemManager does the same on enable.
@@ -398,7 +445,8 @@ impl Modem {
                 let Some((_, [service, instance, _, _])) = qrtr::ctrl_words(payload) else {
                     return;
                 };
-                for (s, v, i, port) in SERVICES {
+                let services: Vec<_> = self.services().collect();
+                for (s, v, i, port) in services {
                     if (service == 0 || service == s)
                         && (instance == 0 || instance == qrtr::instance_word(v, i))
                     {
@@ -419,6 +467,18 @@ impl Modem {
     fn data(&mut self, p: &mut dyn Platform, h: &Header, payload: &[u8]) {
         let from = (h.src_node, h.src_port);
         match h.dst_port {
+            IPA_PORT if self.ipa_up => {
+                let Some(m) = qmi::Msg::parse(payload) else {
+                    return;
+                };
+                if m.ty != qmi::REQUEST {
+                    return;
+                }
+                let resp = self.ipa.request(&m);
+                p.log(format_args!("ipa: request {:#x} from the modem", m.id));
+                self.send(p, qrtr::TYPE_DATA, IPA_PORT, from, &resp);
+                self.ipa_complete(p);
+            }
             RMTFS_PORT | LOCATOR_PORT => {
                 let Some(m) = qmi::Msg::parse(payload) else {
                     return;
@@ -557,6 +617,11 @@ impl Modem {
                     self.status.operator = Text::new(&n);
                 }
             }
+            (IPA, ipa::INIT_DRIVER) => {
+                p.log(format_args!("ipa: the modem took INIT_DRIVER"));
+                self.ipa.modem_ready = true;
+                self.ipa_complete(p);
+            }
             (VOICE, voice::DIAL) => {
                 self.status.call.id = m.u8(0x10).unwrap_or(0);
                 if self.hangup_pending {
@@ -625,7 +690,7 @@ impl Modem {
             self.status.modem = modem_ipc::modem::ONLINE;
             // voice-only once registered: sent as soon as NAS appeared, the modem refused it (QMI error 25) and its
             // SIM service never came up (C5, 2026-11-09)
-            if VOICE_ONLY && !self.selection_sent {
+            if !self.ipa_up && !self.selection_sent {
                 self.selection_sent = true;
                 self.request(p, NAS, nas::SET_SYSTEM_SELECTION, &nas::VOICE_ONLY);
                 self.request(p, NAS, nas::GET_SYSTEM_SELECTION, &[]);
@@ -983,6 +1048,45 @@ mod tests {
         assert_eq!(f.sent.len(), n);
         m.tick(&mut f, 40_000);
         assert_eq!(f.sent.len(), n + 2);
+    }
+
+    #[test]
+    fn ipa_handshake_through_the_router() {
+        let (mut m, mut f) = (modem(), fake());
+        m.ipa_up = true;
+        m.start(&mut f);
+        assert_eq!(f.sent.len(), 5); // HELLO + rmtfs, locator, TFTP and IPA servers
+        let n = f.sent.len();
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_NEW_SERVER,
+                PORT_CTRL,
+                PORT_CTRL,
+                &qrtr::ctrl(4, [ipa::SERVICE, qrtr::instance_word(1, 2), 0, 30]),
+            ),
+        );
+        assert_eq!(f.sent.len(), n + 1);
+        let (_, dst, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!((dst, id), (30, ipa::INIT_DRIVER));
+        m.handle(
+            &mut f,
+            &from_modem(
+                qrtr::TYPE_DATA,
+                30,
+                0x24,
+                &ok(txn, ipa::INIT_DRIVER).finish(),
+            ),
+        );
+        for id in [ipa::DRIVER_INIT_COMPLETE, ipa::INDICATION_REGISTER] {
+            let q = qmi::Builder::new(qmi::REQUEST, 3, id).u8(1, 0).finish();
+            m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 41, IPA_PORT, &q));
+        }
+        let (h, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        let ind = qmi::Msg::parse(pay).unwrap();
+        assert_eq!((h.src_port, h.dst_port), (IPA_PORT, 30)); // to the modem's server, not the requester
+        assert_eq!((ind.ty, ind.id), (qmi::INDICATION, ipa::INIT_COMPLETE));
+        assert!(f.logs.iter().any(|l| l == "ipa: handshake complete"));
     }
 
     #[test]

@@ -134,6 +134,8 @@ struct Daemon {
     t0: u64,
     last_log: u64,
     fatal_seen: bool,
+    /// the kernel runs IPA: LTE allowed, the IPA handshake on (else voice-only)
+    ipa_up: bool,
 }
 
 impl Daemon {
@@ -166,11 +168,12 @@ impl Daemon {
                             },
                         );
                         dprintln!(
-                            "[modemd] ipa: firmware {} bytes (mdt {}) -> {}",
+                            "[modemd] ipa: firmware {} bytes (mdt {}), IPA bring-up -> {}",
                             image.len(),
                             mdt_len,
                             r
                         );
+                        self.ipa_up = r == 0;
                     }
                     Err(ext4ro::Error::Io(e)) if e == err::KERR_NOT_SUPPORTED => return Err(e),
                     Err(e) => dprintln!("[modemd] ipa: no firmware from vendor_a ({:?})", e),
@@ -238,7 +241,9 @@ impl Daemon {
             info.len
         );
         let images = core::mem::take(&mut self.images);
-        self.modem = Some(Modem::new(images, info.b as u64));
+        let mut modem = Modem::new(images, info.b as u64);
+        modem.ipa_up = self.ipa_up;
+        self.modem = Some(modem);
         let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
         if r < 0 {
             self.fail("modem boot start", r);
@@ -442,6 +447,7 @@ fn main() -> i32 {
         t0: 0,
         last_log: 0,
         fatal_seen: false,
+        ipa_up: false,
     };
     rt::block_on(async {
         let mut receive = pin!(server.receive());
