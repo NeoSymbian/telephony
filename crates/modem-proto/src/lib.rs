@@ -62,6 +62,10 @@ const DMS_SET_OPERATING_MODE: u16 = 0x2e;
 const UIM_GET_CARD_STATUS: u16 = 0x2f;
 /// NAS polls, as ModemManager does (indications cover the rest)
 const POLL_MS: u64 = 30_000;
+/// 2G/3G circuit-switched only (NAS system selection, until power cycle): no packet data reaches the modem's IPA path,
+/// which we don't run yet: on LTE data the modem asserts "IPA Assert: new_free_space > 0" (C5).
+/// shortcut: until IPA (docs/telephony.md C5b) drains the modem's data path; then LTE comes back.
+pub const VOICE_ONLY: bool = true;
 pub const KERR_NOT_READY: i32 = -18;
 pub const KERR_ARGUMENT: i32 = -6;
 pub const KERR_IN_USE: i32 = -14;
@@ -104,6 +108,9 @@ pub struct Modem {
     plmn_asked: Option<(u16, u16)>,
     hangup_pending: bool,
     last_poll: u64,
+    /// NAS circuit-switched attach, for the log
+    cs: u8,
+    selection_sent: bool,
 }
 
 /// "350000000000012" -> "35xxxxxxxxxxx12": never log a whole IMEI.
@@ -132,6 +139,8 @@ impl Modem {
             plmn_asked: None,
             hangup_pending: false,
             last_poll: 0,
+            cs: 0,
+            selection_sent: false,
         }
     }
 
@@ -266,6 +275,17 @@ impl Modem {
         self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
     }
 
+    /// The modem died (SMP2P fatal): nothing it reported holds any more. The UI shows "No service".
+    /// shortcut: no restart (SSR) yet; a reboot brings the modem back.
+    pub fn lost(&mut self) {
+        self.status = Status {
+            modem: modem_ipc::modem::FAILED,
+            sim: self.status.sim,
+            ..Status::default()
+        };
+        self.clients.clear();
+    }
+
     /// Place a call (modem_ipc::op::DIAL). KErrArgument for a number [`voice::dialable`] refuses, KErrInUse while a
     /// call is up, KErrNotReady before VOICE is there.
     pub fn dial(&mut self, p: &mut dyn Platform, number: &str) -> Result<(), i32> {
@@ -332,19 +352,20 @@ impl Modem {
             return;
         }
         let from = (h.src_node, h.src_port);
+        // flow control: a sender marks a packet confirm_rx and waits for RESUME_TX before it sends that port more.
+        // Every type, control included: unconfirmed NEW_SERVERs stalled the modem's announcements, and DMS or UIM
+        // never arrived (C5, 2026-11-09). Linux confirms whatever a socket receives.
+        if h.confirm_rx != 0 && h.ty != qrtr::TYPE_RESUME_TX {
+            self.send(
+                p,
+                qrtr::TYPE_RESUME_TX,
+                h.dst_port,
+                from,
+                &qrtr::ctrl(qrtr::TYPE_RESUME_TX, [NODE, h.dst_port, 0, 0]),
+            );
+        }
         match h.ty {
-            qrtr::TYPE_DATA => {
-                self.data(p, &h, payload);
-                if h.confirm_rx != 0 {
-                    self.send(
-                        p,
-                        qrtr::TYPE_RESUME_TX,
-                        h.dst_port,
-                        from,
-                        &qrtr::ctrl(qrtr::TYPE_RESUME_TX, [NODE, h.dst_port, 0, 0]),
-                    );
-                }
-            }
+            qrtr::TYPE_DATA => self.data(p, &h, payload),
             qrtr::TYPE_HELLO if !self.hello_seen => {
                 self.hello_seen = true;
                 self.ctrl(p, qrtr::TYPE_HELLO, (h.src_node, PORT_CTRL), [0; 4]);
@@ -525,6 +546,11 @@ impl Modem {
             }
             (NAS, nas::GET_SERVING_SYSTEM) => self.serving(p, m),
             (NAS, nas::GET_SIGNAL_INFO) => self.signal(m),
+            (NAS, nas::SET_SYSTEM_SELECTION) => p.log(format_args!("nas: voice-only mode set")),
+            (NAS, nas::GET_SYSTEM_SELECTION) => p.log(format_args!(
+                "nas: mode preference {:#x}",
+                nas::mode_preference(m).unwrap_or(0)
+            )),
             (NAS, nas::GET_PLMN_NAME) => {
                 if let Some(n) = nas::plmn_name(m) {
                     p.log(format_args!("nas: operator {n}"));
@@ -584,12 +610,27 @@ impl Modem {
         let Some(s) = nas::serving(m) else {
             return;
         };
-        if (s.reg, s.rat) != (self.status.reg, self.status.rat) {
-            p.log(format_args!("nas: registration {} rat {}", s.reg, s.rat));
+        if (s.reg, s.rat, s.cs) != (self.status.reg, self.status.rat, self.cs) {
+            p.log(format_args!(
+                "nas: registration {} rat {} cs {} ps {}",
+                s.reg, s.rat, s.cs, s.ps
+            ));
         }
+        self.cs = s.cs;
         self.status.reg = s.reg;
         self.status.rat = s.rat;
         let registered = matches!(s.reg, modem_ipc::reg::HOME | modem_ipc::reg::ROAMING);
+        if registered {
+            // online, whether or not our Set Operating Mode was needed (C5: "invalid transition" when it already was)
+            self.status.modem = modem_ipc::modem::ONLINE;
+            // voice-only once registered: sent as soon as NAS appeared, the modem refused it (QMI error 25) and its
+            // SIM service never came up (C5, 2026-11-09)
+            if VOICE_ONLY && !self.selection_sent {
+                self.selection_sent = true;
+                self.request(p, NAS, nas::SET_SYSTEM_SELECTION, &nas::VOICE_ONLY);
+                self.request(p, NAS, nas::GET_SYSTEM_SELECTION, &[]);
+            }
+        }
         if !registered {
             self.status.bars = 0;
             self.status.operator = Text::default();
@@ -608,7 +649,7 @@ impl Modem {
     }
 
     fn signal(&mut self, m: &qmi::Msg) {
-        if let Some(b) = nas::bars(m) {
+        if let Some(b) = nas::bars(m, self.status.rat) {
             let registered = matches!(
                 self.status.reg,
                 modem_ipc::reg::HOME | modem_ipc::reg::ROAMING
@@ -797,13 +838,26 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_control_packets_get_resume_tx_too() {
+        let (mut m, mut f) = (modem(), fake());
+        let mut pkt = ns(15, 22);
+        pkt[16] = 1;
+        m.handle(&mut f, &pkt);
+        let (h, p) = qrtr::decode(&f.sent[0]).unwrap();
+        assert_eq!((h.ty, h.dst_port), (qrtr::TYPE_RESUME_TX, PORT_CTRL));
+        assert_eq!(qrtr::ctrl_words(p), Some((7, [NODE, PORT_CTRL, 0, 0])));
+        assert_eq!(m.servers.len(), 1);
+    }
+
+    #[test]
     fn confirm_rx_gets_resume_tx() {
         let (mut m, mut f) = (modem(), fake());
         let q = qmi::Builder::new(qmi::REQUEST, 1, 0x24).finish();
         let mut pkt = from_modem(qrtr::TYPE_DATA, 30, LOCATOR_PORT, &q);
         pkt[16] = 1;
         m.handle(&mut f, &pkt);
-        let (h, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        assert_eq!(f.sent.len(), 2); // RESUME_TX, then the locator's reply
+        let (h, p) = qrtr::decode(&f.sent[0]).unwrap();
         assert_eq!((h.ty, h.dst_port), (qrtr::TYPE_RESUME_TX, 30));
         assert_eq!(qrtr::ctrl_words(p), Some((7, [NODE, LOCATOR_PORT, 0, 0])));
     }
@@ -899,6 +953,17 @@ mod tests {
             (m.status.reg, m.status.rat),
             (modem_ipc::reg::HOME, modem_ipc::rat::LTE)
         );
+        // registered: voice-only (once), then the name
+        let n = f.sent.len();
+        let sel = &f.sent[n - 3];
+        assert_eq!(req(sel).2, nas::SET_SYSTEM_SELECTION);
+        let (_, pay) = qrtr::decode(sel).unwrap();
+        let sel = qmi::Msg::parse(pay).unwrap();
+        assert_eq!(
+            (sel.tlv(0x11), sel.tlv(0x18), sel.tlv(0x17)),
+            (Some(&[0x0c, 0][..]), Some(&[0u8; 4][..]), Some(&[0u8][..]))
+        );
+        assert_eq!(req(&f.sent[n - 2]).2, nas::GET_SYSTEM_SELECTION);
         let (_, _, id, txn) = req(f.sent.last().unwrap());
         assert_eq!(id, nas::GET_PLMN_NAME);
         let mut t = alloc::vec![0, 0, 0, 0, 0, 4];

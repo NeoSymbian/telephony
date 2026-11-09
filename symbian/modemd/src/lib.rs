@@ -250,8 +250,8 @@ impl Daemon {
             );
             if s[2] & FATAL != 0 && !self.fatal_seen {
                 self.fatal_seen = true;
-                dprintln!("[modemd] the modem raised FATAL");
-                modem.status.modem = modem_ipc::modem::FAILED;
+                dprintln!("[modemd] the modem raised FATAL: no service until a reboot");
+                modem.lost();
             }
         }
     }
@@ -273,14 +273,34 @@ impl Service for Daemon {
             op::STATUS => msg
                 .write8(0, &self.status().to_bytes(), 0)
                 .map_or_else(|e| e, |_| err::KERR_NONE),
-            op::DIAL => match (&mut self.modem, msg.read8_vec(0)) {
-                (Some(m), Ok(n)) => match core::str::from_utf8(&n) {
-                    Ok(n) => m.dial(&mut Hal, n).err().unwrap_or(err::KERR_NONE),
-                    Err(_) => err::KERR_ARGUMENT,
-                },
-                (_, Err(e)) => e,
-                (None, _) => NOT_READY,
-            },
+            op::DIAL => {
+                let read = msg.read8_vec(0);
+                let r = match (&mut self.modem, &read) {
+                    (Some(m), Ok(n)) => match core::str::from_utf8(n) {
+                        Ok(n) => m.dial(&mut Hal, n).err().unwrap_or(err::KERR_NONE),
+                        Err(_) => err::KERR_ARGUMENT,
+                    },
+                    (_, Err(e)) => *e,
+                    (None, _) => NOT_READY,
+                };
+                if r != err::KERR_NONE {
+                    // what came in, without the number: its length, digit count and any non-digit bytes
+                    let (len, digits, other) = read.as_ref().map_or((0, 0, Vec::new()), |n| {
+                        let other: Vec<u8> =
+                            n.iter().copied().filter(|c| !c.is_ascii_digit()).collect();
+                        (n.len(), n.len() - other.len(), other)
+                    });
+                    dprintln!(
+                        "[modemd] dial refused ({}): read {:?}, {} bytes, {} digits, other {:02x?}",
+                        r,
+                        read.as_ref().map(|_| ()),
+                        len,
+                        digits,
+                        other
+                    );
+                }
+                r
+            }
             op::ANSWER => self.modem.as_mut().map_or(NOT_READY, |m| {
                 m.answer(&mut Hal).err().unwrap_or(err::KERR_NONE)
             }),

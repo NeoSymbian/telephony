@@ -10,16 +10,32 @@ pub const SERVICE: u32 = 3;
 pub const REGISTER_INDICATIONS: u16 = 0x03;
 pub const GET_SERVING_SYSTEM: u16 = 0x24; // also the serving system indication
 pub const GET_PLMN_NAME: u16 = 0x44;
+pub const SET_SYSTEM_SELECTION: u16 = 0x33;
+pub const GET_SYSTEM_SELECTION: u16 = 0x34;
 pub const GET_SIGNAL_INFO: u16 = 0x4f;
 pub const SIGNAL_INFO_IND: u16 = 0x51;
 
 /// Register Indications: serving system (0x13) and signal info (0x19) on.
 pub const INDICATIONS: [(u8, &[u8]); 2] = [(0x13, &[1]), (0x19, &[1])];
 
+/// Set System Selection Preference for voice only: mode preference (0x11) GSM | UMTS, service domain (0x18) CS only,
+/// change duration (0x17) until power cycle, so nothing is persisted in the modem's NV (libqmi layouts).
+pub const VOICE_ONLY: [(u8, &[u8]); 3] =
+    [(0x11, &[0x0c, 0x00]), (0x18, &[0, 0, 0, 0]), (0x17, &[0])];
+
+/// Get System Selection Preference: the mode preference bitmask (TLV 0x11; C1 read 0x1f = all five).
+pub fn mode_preference(m: &Msg) -> Option<u16> {
+    let t = m.tlv(0x11)?;
+    Some(u16::from_le_bytes([*t.first()?, *t.get(1)?]))
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Serving {
     pub reg: u8,
     pub rat: u8,
+    /// circuit- and packet-switched attach (1 attached, 2 detached): CS carries calls (CSFB from LTE)
+    pub cs: u8,
+    pub ps: u8,
     /// MCC, MNC and the network's description, when the modem gave them (TLV 0x12)
     pub plmn: Option<(u16, u16)>,
     pub name: Option<alloc::string::String>,
@@ -53,6 +69,8 @@ pub fn serving(m: &Msg) -> Option<Serving> {
     let mut s = Serving {
         reg: state,
         rat,
+        cs: *t.get(1)?,
+        ps: *t.get(2)?,
         ..Default::default()
     };
     if let Some(p) = m.tlv(0x12).filter(|p| p.len() >= 5) {
@@ -86,16 +104,26 @@ pub fn plmn_name(m: &Msg) -> Option<alloc::string::String> {
         .find_map(ascii)
 }
 
-/// Bars 0..=4 from Get Signal Info / the Signal Info indication: LTE RSRP (TLV 0x14 {i8 rssi, i8 rsrq, i16 rsrp,
-/// i16 snr}) first, else WCDMA (0x13 {i8 rssi, i16 ecio}) or GSM (0x12 {i8 rssi}) RSSI. None without any.
-pub fn bars(m: &Msg) -> Option<u8> {
+/// Bars 0..=4 for the technology in use (`modem_ipc::rat`) from Get Signal Info / the Signal Info indication: LTE
+/// RSRP (TLV 0x14 {i8 rssi, i8 rsrq, i16 rsrp, i16 snr}), WCDMA (0x13 {i8 rssi, i16 ecio}) or GSM (0x12 {i8 rssi})
+/// RSSI. On 3G the modem still sends an LTE TLV with invalid values (C5), so only the current one counts. None when
+/// that TLV is missing or invalid.
+pub fn bars(m: &Msg, rat: u8) -> Option<u8> {
     // my call: the usual phone thresholds
     let steps = |v: i32, top: i32| (0..4).filter(|i| v >= top - 10 * i).count() as u8;
-    if let Some(l) = m.tlv(0x14).filter(|l| l.len() >= 4) {
-        return Some(steps(i16::from_le_bytes([l[2], l[3]]) as i32, -85));
+    match rat {
+        rat::LTE => {
+            let l = m.tlv(0x14).filter(|l| l.len() >= 4)?;
+            let rsrp = i16::from_le_bytes([l[2], l[3]]) as i32;
+            (-140..0).contains(&rsrp).then(|| steps(rsrp, -85))
+        }
+        rat::UMTS | rat::GSM => {
+            let t = if rat == rat::UMTS { 0x13 } else { 0x12 };
+            let rssi = *m.tlv(t)?.first()? as i8 as i32;
+            (-120..0).contains(&rssi).then(|| steps(rssi, -77))
+        }
+        _ => None,
     }
-    let rssi = m.tlv(0x13).or_else(|| m.tlv(0x12))?;
-    Some(steps(*rssi.first()? as i8 as i32, -77))
 }
 
 fn ascii(b: &[u8]) -> Option<alloc::string::String> {
@@ -167,16 +195,28 @@ mod tests {
         let b = Builder::new(INDICATION, 5, SIGNAL_INFO_IND)
             .tlv(0x14, &[0xca, 0xee, 0xa3, 0xff, 0x24, 0x00])
             .finish();
-        assert_eq!(bars(&msg(&b)), Some(3));
+        assert_eq!(bars(&msg(&b), rat::LTE), Some(3));
         let b = Builder::new(INDICATION, 6, SIGNAL_INFO_IND)
             .tlv(0x13, &[0xb2, 0x07, 0x00])
             .finish();
-        assert_eq!(bars(&msg(&b)), Some(3));
+        assert_eq!(bars(&msg(&b), rat::UMTS), Some(3));
         let b = Builder::new(INDICATION, 7, SIGNAL_INFO_IND)
-            .tlv(0x12, &[(-120i8) as u8])
+            .tlv(0x12, &[(-110i8) as u8])
             .finish();
-        assert_eq!(bars(&msg(&b)), Some(0));
+        assert_eq!(bars(&msg(&b), rat::GSM), Some(0));
         let b = Builder::new(INDICATION, 8, SIGNAL_INFO_IND).finish();
-        assert_eq!(bars(&msg(&b)), None);
+        assert_eq!(bars(&msg(&b), rat::LTE), None);
+    }
+
+    // C5 on the phone: on 3G an LTE TLV with invalid values comes along; the WCDMA one counts
+    #[test]
+    fn bars_follow_the_technology() {
+        let b = Builder::new(INDICATION, 9, SIGNAL_INFO_IND)
+            .tlv(0x14, &[0x80, 0x80, 0x00, 0x80, 0x00, 0x80])
+            .tlv(0x13, &[0xb2, 0x07, 0x00])
+            .finish();
+        assert_eq!(bars(&msg(&b), rat::UMTS), Some(3));
+        assert_eq!(bars(&msg(&b), rat::LTE), None);
+        assert_eq!(bars(&msg(&b), rat::NONE), None);
     }
 }
