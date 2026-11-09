@@ -315,7 +315,7 @@ impl CallAudio {
             apr: Default::default(),
             muted: false,
             speaker: false,
-            volume: 8,
+            volume: 10,
         }
     }
 
