@@ -404,11 +404,13 @@ impl Audio {
                     q.push(Destroy(SVC_CVP));
                 }
             }
+            // the loopback's destination first: with the mic's port stopped first, the speaker port's stop was never
+            // answered and the ADSP's AFE stopped answering (C6 2026-11-09)
             Mode::Test => q.extend([
                 Loopback(false),
                 Codecs(false),
-                Port(MIC, false),
                 Port(SPK, false),
+                Port(MIC, false),
             ]),
             Mode::Off => {}
         }
@@ -774,6 +776,17 @@ mod tests {
         a.set(Mode::Off);
         let (ops, codecs) = drive(&mut a, 100);
         assert_eq!(ops, [AFE_SET_PARAM_V2, AFE_DEVICE_STOP, AFE_DEVICE_STOP]);
+        // the loopback's destination (the speaker port) stops before its source
+        use Cmd::*;
+        assert_eq!(
+            a.queue,
+            [
+                Loopback(false),
+                Codecs(false),
+                Port(SPK, false),
+                Port(MIC, false)
+            ]
+        );
         assert_eq!(codecs, [false]);
         assert!(a.idle() && a.is() == Mode::Off);
     }
