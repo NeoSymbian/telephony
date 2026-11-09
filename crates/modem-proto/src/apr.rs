@@ -48,8 +48,8 @@ const BCLK_HZ: u32 = 6_144_000; // 48 kHz x 8 slots x 16 bits
 const VOICE_PATH: u16 = 6;
 const VOICE_SESSION: &[u8] = b"11C05000";
 /// the ADSP's built-in voice topologies (TX: single-mic echo cancellation + noise suppression, RX: default), the voice
-/// driver's defaults. C1's UCM ids (0x1000fffc, 0x10010f87) need the ACDB calibration loaded: without it the CVP's
-/// topology commit failed (status 1) and the session was gone (C6 2026-11-09).
+/// driver's defaults. C1's UCM ids (0x1000fffc, 0x10010f87) commit under Linux but not here (status 1, even with
+/// Linux's exact packets, C6 2026-11-09); these commit, enable and attach.
 const TOPOLOGY: (u32, u32) = (0x0001_0f71, 0x0001_0f77);
 /// Linux waits 3 s for an AFE answer; a voice start can take a while too
 const ACK_TIMEOUT_MS: u64 = 3000;
@@ -185,6 +185,18 @@ pub fn afe_slot_map(port: (u16, u16, u32)) -> Vec<u8> {
     afe_port_param(port, 0x0001_028a, 0x0001_0297, &d)
 }
 
+/// AFE loopback (Dev tools' audio test): the mic's TX port fed straight to the amps' RX port, routing mode default.
+/// Ids from Android's msm q6afe (AFE_MODULE_LOOPBACK, AFE_PARAM_ID_LOOPBACK_CONFIG v1): not seen in a capture yet.
+pub fn afe_loopback(on: bool) -> Vec<u8> {
+    let mut d = Vec::new();
+    le32(&mut d, 1);
+    le16(&mut d, SPK.1);
+    le16(&mut d, 1);
+    le16(&mut d, on as u16);
+    le16(&mut d, 0);
+    afe_port_param(MIC, 0x0001_0205, 0x0001_020b, &d)
+}
+
 pub fn afe_start(port: (u16, u16, u32), on: bool) -> Vec<u8> {
     let mut pl = Vec::new();
     le16(&mut pl, port.1);
@@ -276,6 +288,7 @@ enum Cmd {
     Attach(bool),
     Voice(bool),
     Destroy(u8),
+    Loopback(bool),
 }
 
 /// What the daemon does next.
@@ -299,24 +312,25 @@ pub struct Audio {
     mvm: u16,
     cvp: u16,
     pub running: bool,
+    /// the running sequence is Dev tools' loopback test, not a call
+    pub testing: bool,
     pub failures: u32,
 }
 
 impl Audio {
-    /// A call connected: ports, codecs, voice.
+    /// A call connected, in the order of Linux's working call (C6 capture 2026-11-09): the mic's clock and port, the
+    /// speaker's clock, the voice sessions and START_VOICE, then the speaker's port, then the codecs (the amps' PLL
+    /// locks to the speaker port's bit clock).
     pub fn start(&mut self) {
         use Cmd::*;
+        self.testing = false;
         self.queue = alloc::vec![
             CoreReady,
-            Clock(SPK),
             Clock(MIC),
-            TdmConfig(SPK),
-            SlotMap(SPK),
-            Port(SPK, true),
             TdmConfig(MIC),
             SlotMap(MIC),
             Port(MIC, true),
-            Codecs(true),
+            Clock(SPK),
             MvmCreate,
             DualControl,
             CvpCreate,
@@ -328,32 +342,71 @@ impl Audio {
             CvpEnable(true),
             Attach(true),
             Voice(true),
+            TdmConfig(SPK),
+            SlotMap(SPK),
+            Port(SPK, true),
+            Codecs(true),
         ];
         self.reset_queue();
         self.core_tries = 0;
         self.running = true;
     }
 
-    /// The call ended: voice, codecs, ports (the reverse; sessions destroyed MVM then CVP, as Linux).
+    /// The call ended, as Linux: the codecs, the mic's port, voice off, the speaker's port, the sessions destroyed MVM
+    /// then CVP. The clocks stay on (Linux never turns them off; the next call sets them again).
     pub fn stop(&mut self) {
         use Cmd::*;
-        let mut q = alloc::vec![Voice(false), Attach(false), CvpEnable(false)];
+        if self.testing {
+            self.queue = alloc::vec![
+                Loopback(false),
+                Codecs(false),
+                Port(MIC, false),
+                Port(SPK, false)
+            ];
+            self.reset_queue();
+            self.running = false;
+            self.testing = false;
+            return;
+        }
+        let mut q = alloc::vec![
+            Codecs(false),
+            Port(MIC, false),
+            Voice(false),
+            Attach(false),
+            CvpEnable(false),
+            Port(SPK, false),
+        ];
         if self.mvm != 0 {
             q.push(Destroy(SVC_MVM));
         }
         if self.cvp != 0 {
             q.push(Destroy(SVC_CVP));
         }
-        q.extend([
-            Codecs(false),
-            Port(MIC, false),
-            Port(SPK, false),
-            Clock(MIC),
-            Clock(SPK),
-        ]);
         self.queue = q;
         self.reset_queue();
         self.running = false;
+    }
+
+    /// Dev tools' audio test, no call needed: both ports, the codecs, then the mic looped back to the amps.
+    pub fn test(&mut self) {
+        use Cmd::*;
+        self.queue = alloc::vec![
+            CoreReady,
+            Clock(MIC),
+            TdmConfig(MIC),
+            SlotMap(MIC),
+            Port(MIC, true),
+            Clock(SPK),
+            TdmConfig(SPK),
+            SlotMap(SPK),
+            Port(SPK, true),
+            Codecs(true),
+            Loopback(true),
+        ];
+        self.reset_queue();
+        self.core_tries = 0;
+        self.running = true;
+        self.testing = true;
     }
 
     fn reset_queue(&mut self) {
@@ -403,6 +456,7 @@ impl Audio {
                 DESTROY_SESSION,
                 &[],
             ),
+            Loopback(on) => afe_loopback(on),
             Codecs(_) => Vec::new(),
         }
     }
@@ -528,7 +582,7 @@ mod tests {
             .collect()
     }
 
-    // the worked packets of FACTS-C6-apr.md (the bytes C1's Linux sent, zeros where it left stack garbage)
+    // the bytes C1's Linux sent in a working call (APR kprobe capture, C6 2026-11-09; zeros where it left stack garbage)
     #[test]
     fn afe_packets_match_c1() {
         assert_eq!(
@@ -646,9 +700,15 @@ mod tests {
         assert_eq!((a.mvm, a.cvp), (0x11, 0x22));
         assert_eq!(codecs, [true]);
         assert_eq!(ops.first(), Some(&CORE_GET_STATE));
-        assert_eq!(ops.last(), Some(&MVM_START));
-        let start = ops.iter().position(|&o| o == AFE_DEVICE_START).unwrap();
-        assert!(start < ops.iter().position(|&o| o == MVM_CREATE_PASSIVE).unwrap());
+        // Linux's order: the mic's port before the voice sessions, the speaker's after START_VOICE
+        let voice = ops.iter().position(|&o| o == MVM_START).unwrap();
+        let starts: Vec<_> = (0..ops.len())
+            .filter(|&i| ops[i] == AFE_DEVICE_START)
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts[0] < ops.iter().position(|&o| o == MVM_CREATE_PASSIVE).unwrap());
+        assert_eq!(starts[1], ops.len() - 1);
+        assert!(voice < starts[1]);
         assert_eq!(ops.len(), 20);
         a.stop();
         let mut stop_ops = Vec::new();
@@ -666,13 +726,77 @@ mod tests {
                 Out::Nothing => {}
             }
         }
-        assert_eq!(&stop_ops[..3], &[MVM_STOP, MVM_DETACH, CVP_DISABLE]);
+        assert_eq!(
+            stop_ops,
+            [
+                AFE_DEVICE_STOP,
+                MVM_STOP,
+                MVM_DETACH,
+                CVP_DISABLE,
+                AFE_DEVICE_STOP,
+                DESTROY_SESSION,
+                DESTROY_SESSION
+            ]
+        );
         assert_eq!(codecs, [true, false]);
         assert_eq!((a.mvm, a.cvp), (0, 0));
         assert!(
             a.idle() && logs.iter().all(|l| l.ends_with(" ok")),
             "{logs:?}"
         );
+    }
+
+    // Dev tools' audio test: both ports and the codecs, then the AFE loopback mic -> amps; stopped in reverse
+    #[test]
+    fn the_loopback_test_starts_and_stops() {
+        assert_eq!(
+            afe_loopback(true),
+            hex(
+                "50 02 3c 00 04 05 00 00 04 04 00 00 19 00 00 00 ef 00 01 00 01 90 18 00 00 00 00 00 00 00 00 00 \
+                 00 00 00 00 05 02 01 00 0b 02 01 00 0c 00 00 00 01 00 00 00 10 90 01 00 01 00 00 00"
+            )
+        );
+        let mut a = Audio::default();
+        let mut log = |_: core::fmt::Arguments| {};
+        let mut run = |a: &mut Audio| {
+            let (mut ops, mut codecs) = (Vec::new(), Vec::new());
+            for now in 0..100 {
+                match a.poll(now, &mut log) {
+                    Out::Send(p) => {
+                        let op = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
+                        ops.push(op);
+                        if op == CORE_GET_STATE {
+                            let mut r =
+                                packet(SVC_CORE, 0, 0, 0, CORE_GET_STATE_RSP, &1u32.to_le_bytes());
+                            r[0] = 0x50;
+                            r[1] = 0x01;
+                            a.handle(&r, &mut log);
+                        } else {
+                            a.handle(&ack(&p, 0, 0), &mut log);
+                        }
+                    }
+                    Out::Codecs(on) => {
+                        codecs.push(on);
+                        a.codecs_done(true, &mut log);
+                    }
+                    Out::Nothing => {}
+                }
+            }
+            (ops, codecs)
+        };
+        a.test();
+        let (ops, codecs) = run(&mut a);
+        assert!(a.idle() && a.running && a.testing);
+        assert_eq!(codecs, [true]);
+        assert_eq!(ops.len(), 10); // core, 2 clocks, 2 x (config, slots, start), loopback
+        assert_eq!(ops.iter().filter(|&&o| o == AFE_DEVICE_START).count(), 2);
+        assert_eq!(ops.last(), Some(&AFE_SET_PARAM_V2));
+        assert!(!ops.contains(&MVM_CREATE_PASSIVE));
+        a.stop();
+        let (ops, codecs) = run(&mut a);
+        assert_eq!(ops, [AFE_SET_PARAM_V2, AFE_DEVICE_STOP, AFE_DEVICE_STOP]);
+        assert_eq!(codecs, [false]);
+        assert!(a.idle() && !a.running && !a.testing);
     }
 
     #[test]

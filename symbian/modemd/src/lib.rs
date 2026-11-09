@@ -43,8 +43,6 @@ const MODEM_NODE: u32 = 0;
 const FATAL: u32 = 1;
 const BOOT_TIMEOUT_MS: u64 = 60_000;
 const STATUS_LOG_MS: u64 = 30_000;
-/// the ADSP loads once the modem's start-up traffic has settled (they overlapped badly: C6 2026-11-09)
-const ADSP_AFTER_MS: u64 = 20_000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -128,6 +126,9 @@ enum Phase {
     Ipa,
     /// reading partition i (one per loop step)
     Read(usize),
+    /// the ADSP loads and comes up before the modem boots, Linux's order (C6: the modem joins the ADSP's voice
+    /// session only if the ADSP was there first, under test 2026-11-09)
+    Adsp,
     /// the kernel boots the modem; since t0
     Wait(u64),
     Running,
@@ -227,6 +228,17 @@ impl Daemon {
                     self.boot();
                 }
             }
+            Phase::Adsp => {
+                self.adsp.step();
+                if let Some(m) = &mut self.modem {
+                    while let Some(n) = adsp::recv(adsp::RING_QRTR, &mut self.rx) {
+                        m.handle(&mut Hal, &self.rx[..n]);
+                    }
+                }
+                if !self.adsp.busy() {
+                    self.boot_modem();
+                }
+            }
             Phase::Wait(t0) => {
                 let s = state();
                 if s[1] != 0 {
@@ -259,6 +271,35 @@ impl Daemon {
         if r < 0 { r } else { err::KERR_NONE }
     }
 
+    /// Dev tools' audio test (no call): 1 loudspeaker, 2 earpiece, the mic looped back to the amps; 0 stops it.
+    fn audio_test(&mut self, what: i32) -> i32 {
+        if !matches!(self.adsp, adsp::Adsp::Up) {
+            return NOT_READY;
+        }
+        if self.audio.apr.running && !self.audio.apr.testing {
+            return err::KERR_IN_USE; // a call's audio
+        }
+        dprintln!(
+            "[modemd] audio test {}",
+            ["stop", "loudspeaker", "earpiece"]
+                .get(what as usize)
+                .unwrap_or(&"?")
+        );
+        match what {
+            0 if self.audio.apr.testing => self.audio.apr.stop(),
+            0 => {}
+            1 | 2 => {
+                if self.audio.apr.testing {
+                    return err::KERR_IN_USE;
+                }
+                self.audio.speaker = what == 1;
+                self.audio.apr.test();
+            }
+            _ => return err::KERR_ARGUMENT,
+        }
+        err::KERR_NONE
+    }
+
     fn boot(&mut self) {
         let (r, info) = hal_io(RMTFS_MEM, Io::default());
         if r < 0 {
@@ -274,6 +315,10 @@ impl Daemon {
         let mut modem = Modem::new(images, info.b as u64);
         modem.ipa_up = self.ipa_up;
         self.modem = Some(modem);
+        self.phase = Phase::Adsp;
+    }
+
+    fn boot_modem(&mut self) {
         let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
         if r < 0 {
             self.fail("modem boot start", r);
@@ -297,9 +342,6 @@ impl Daemon {
                 break;
             }
             modem.handle(&mut Hal, &buf[..r as usize]);
-        }
-        if self.adsp.busy() && time::millis() - self.t0 >= ADSP_AFTER_MS {
-            self.adsp.step();
         }
         while let Some(n) = adsp::recv(adsp::RING_QRTR, buf) {
             modem.handle(&mut Hal, &buf[..n]);
@@ -499,6 +541,7 @@ impl Service for Daemon {
                 }
                 r
             }
+            op::AUDIO_TEST => self.audio_test(msg.int(0)),
             _ => err::KERR_NOT_SUPPORTED,
         };
         msg.complete(r);
@@ -537,9 +580,9 @@ fn main() -> i32 {
         let mut receive = pin!(server.receive());
         loop {
             // fast while the ADSP loads (its steps) or a call's audio runs; else every 2 s
-            let loading = d.adsp.busy() && time::millis() - d.t0 >= ADSP_AFTER_MS;
-            let fast = loading || d.audio.busy() || d.audio_call == modem_ipc::call::CONVERSATION;
-            let ms = if matches!(d.phase, Phase::Running) && fast {
+            let fast = d.audio.busy() || d.audio_call == modem_ipc::call::CONVERSATION;
+            let ms = if matches!(d.phase, Phase::Adsp) || matches!(d.phase, Phase::Running) && fast
+            {
                 20
             } else {
                 2000

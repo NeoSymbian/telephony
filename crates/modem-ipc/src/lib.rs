@@ -4,7 +4,9 @@
 //! - [`op::DIAL`]: arg 0 = the number (des8, ASCII digits, `+`, `*`, `#`);
 //! - [`op::ANSWER`], [`op::HANGUP`]: no arguments;
 //! - in a call (C6): [`op::MUTE`] arg 0 = 1/0 (the mic), [`op::SPEAKER`] arg 0 = 1/0 (loudspeaker or earpiece),
-//!   [`op::VOLUME`] arg 0 = 0..=10, [`op::DTMF`] arg 0 = the key (`0-9`, `*`, `#`) or -1 to stop its tone.
+//!   [`op::VOLUME`] arg 0 = 0..=10, [`op::DTMF`] arg 0 = the key (`0-9`, `*`, `#`) or -1 to stop its tone;
+//! - no call (v1.2, Dev tools): [`op::AUDIO_TEST`] arg 0 = 1 loudspeaker, 2 earpiece (the mic looped back to the
+//!   amps), 0 stop; KErrInUse (-14) during a call.
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -12,7 +14,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (1, 1, 0);
+pub const VERSION: (i8, i8, i16) = (1, 2, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -23,6 +25,7 @@ pub mod op {
     pub const SPEAKER: i32 = 6;
     pub const VOLUME: i32 = 7;
     pub const DTMF: i32 = 8;
+    pub const AUDIO_TEST: i32 = 9;
 }
 
 /// [`Status::modem`]
