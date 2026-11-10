@@ -16,6 +16,7 @@ pub mod qrtr;
 pub mod rmtfs;
 pub mod ssctl;
 pub mod tftp;
+pub mod uim;
 pub mod voice;
 
 pub use modem_ipc;
@@ -140,6 +141,14 @@ pub struct Modem {
     /// essential packets the transport refused, sent again by `tick` in order
     outbox: Vec<Unsent>,
     outbox_at: u64,
+    command: Option<(u32, u16, u16, u64)>,
+    now: u64,
+    radio_request: Option<(u16, bool)>,
+    radio_at: u64,
+    pin_id: u8,
+    answered: Vec<u8>,
+    response_seen: bool,
+    heartbeat_at: u64,
 }
 
 /// (type, our port, destination, payload)
@@ -184,6 +193,14 @@ impl Modem {
             selection_sent: false,
             outbox: Vec::new(),
             outbox_at: 0,
+            command: None,
+            now: 0,
+            radio_request: None,
+            radio_at: 0,
+            pin_id: 1,
+            answered: Vec::new(),
+            response_seen: false,
+            heartbeat_at: 0,
             ipa_up: false,
             ipa: ipa::Handshake::default(),
             ipa_init_due: false,
@@ -357,6 +374,7 @@ impl Modem {
                 self.maybe_online(p);
             }
             UIM => {
+                self.request_must(p, UIM, uim::REGISTER, &[(1, &1u32.to_le_bytes())]);
                 self.request_must(p, UIM, UIM_GET_CARD_STATUS, &[]);
             }
             NAS => {
@@ -438,16 +456,248 @@ impl Modem {
 
     /// The radio on (DMS Set Operating Mode online) once there is a SIM: ModemManager does the same on enable.
     fn maybe_online(&mut self, p: &mut dyn Platform) {
-        if !self.online_sent
-            && self.status.sim == modem_ipc::sim::PRESENT
-            && self.request(p, DMS, DMS_SET_OPERATING_MODE, &[(0x01, &[0])])
+        if self.radio_request.is_some()
+            || (self.online_sent && self.now.saturating_sub(self.radio_at) < 2000)
+        {
+            return;
+        }
+        let online = !self.status.airplane;
+        if (!online || self.status.sim == modem_ipc::sim::PRESENT)
+            && (self.status.radio_online != online || !self.online_sent)
+            && self.request(
+                p,
+                DMS,
+                DMS_SET_OPERATING_MODE,
+                &[(1, &[if online { 0 } else { 1 }])],
+            )
         {
             self.online_sent = true;
+            self.radio_at = self.now;
+            let txn = self
+                .clients
+                .iter()
+                .find(|c| c.service == DMS)
+                .map_or(0, |c| c.txn);
+            self.radio_request = Some((txn, online));
+            self.status.pending = true;
+            self.status.result = 0;
+        }
+    }
+
+    pub fn airplane(&mut self, p: &mut dyn Platform, off: bool) -> Result<(), i32> {
+        if self.command.is_some() {
+            return Err(KERR_IN_USE);
+        }
+        self.status.airplane = off;
+        // Queue the latest intent behind an in-flight mode request; its confirmation is not the new intent.
+        if self.radio_request.is_none() {
+            self.radio_at = 0;
+            self.online_sent = false;
+        }
+        self.maybe_online(p);
+        if self.radio_request.is_some() || self.status.radio_online != off {
+            Ok(())
+        } else {
+            Err(KERR_NOT_READY)
+        }
+    }
+
+    fn user_request(
+        &mut self,
+        p: &mut dyn Platform,
+        service: u32,
+        id: u16,
+        tlvs: &[(u8, &[u8])],
+    ) -> Result<(), i32> {
+        if self.command.is_some() || self.radio_request.is_some() {
+            return Err(KERR_IN_USE);
+        }
+        if !self.request(p, service, id, tlvs) {
+            return Err(KERR_NOT_READY);
+        }
+        let txn = self
+            .clients
+            .iter()
+            .find(|c| c.service == service)
+            .map_or(0, |c| c.txn);
+        self.command = Some((service, id, txn, self.now));
+        self.status.pending = true;
+        self.status.result = 0;
+        Ok(())
+    }
+
+    pub fn verify_pin(&mut self, p: &mut dyn Platform, pin: &[u8]) -> Result<(), i32> {
+        if self.status.sim != modem_ipc::sim::PIN_REQUIRED {
+            return Err(KERR_NOT_READY);
+        }
+        if !(4..=8).contains(&pin.len()) || !pin.iter().all(u8::is_ascii_digit) {
+            return Err(KERR_ARGUMENT);
+        }
+        let mut info = alloc::vec![self.pin_id, pin.len() as u8];
+        info.extend_from_slice(pin);
+        // Card slot 1 session, as qmicli-uim verify-pin; usable before GW provisioning.
+        let result = self.user_request(p, UIM, uim::VERIFY_PIN, &[(1, &[6, 0]), (2, &info)]);
+        info.fill(0);
+        result
+    }
+
+    fn target(&self, id: u8) -> Option<Call> {
+        if id == 0 {
+            Some(self.status.call)
+        } else {
+            self.status
+                .calls
+                .find(id)
+                .copied()
+                .or_else(|| (self.status.call.id == id).then_some(self.status.call))
+        }
+    }
+
+    pub fn answer_call(&mut self, p: &mut dyn Platform, id: u8) -> Result<(), i32> {
+        let c = self.target(id).ok_or(KERR_NOT_READY)?;
+        if !c.incoming || !matches!(c.state, call::INCOMING | call::WAITING) {
+            return Err(KERR_NOT_READY);
+        }
+        if c.state == call::WAITING {
+            self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[3])])
+        } else {
+            self.user_request(p, VOICE, voice::ANSWER, &[(1, &[c.id])])
+        }
+    }
+
+    pub fn end_call(&mut self, p: &mut dyn Platform, id: u8) -> Result<(), i32> {
+        let c = self.target(id).ok_or(KERR_NOT_READY)?;
+        if matches!(c.state, call::NONE | call::END) {
+            return Err(KERR_NOT_READY);
+        }
+        // DIAL can publish its indication before its response. Cancellation bypasses the
+        // user-command slot only for that selected outgoing call, never an existing held call.
+        let dialing = self
+            .command
+            .is_some_and(|(s, msg, _, _)| s == VOICE && msg == voice::DIAL)
+            && !c.incoming
+            && c.id == self.status.call.id
+            && matches!(
+                c.state,
+                call::ORIGINATION
+                    | call::CC_IN_PROGRESS
+                    | call::ALERTING
+                    | call::CONVERSATION
+                    | call::DISCONNECTING
+            );
+        if c.id == 0 || dialing {
+            return self.hangup(p);
+        }
+        self.user_request(p, VOICE, voice::END, &[(1, &[c.id])])
+    }
+
+    pub fn manage(&mut self, p: &mut dyn Platform, action: i32, id: u8) -> Result<(), i32> {
+        use modem_ipc::manage;
+        let c = self.target(id).ok_or(KERR_NOT_READY)?;
+        let held = self
+            .status
+            .calls
+            .as_slice()
+            .iter()
+            .any(|c| c.state == call::HOLD);
+        let active = self
+            .status
+            .calls
+            .as_slice()
+            .iter()
+            .any(|c| c.state == call::CONVERSATION);
+        let waiting = self
+            .status
+            .calls
+            .as_slice()
+            .iter()
+            .any(|c| c.state == call::WAITING);
+        // QmiVoiceSupplementaryServiceType: hold/accept=3, select=4, conference=5.
+        match action {
+            manage::HOLD if c.state == call::CONVERSATION => {
+                self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[3])])
+            }
+            manage::RESUME if c.state == call::HOLD => {
+                self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[4]), (0x10, &[c.id])])
+            }
+            manage::SWAP if active && (held || waiting) => {
+                self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[3])])
+            }
+            manage::MERGE if active && held => {
+                self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[5])])
+            }
+            manage::HOLD | manage::RESUME | manage::SWAP | manage::MERGE => Err(KERR_NOT_READY),
+            _ => Err(KERR_ARGUMENT),
+        }
+    }
+
+    /// Rebuild volatile state after a confirmed kernel stop. RAM EFS and user intent survive.
+    pub fn reset(&mut self, keep_adsp: bool) {
+        let images = core::mem::take(&mut self.rmtfs.images);
+        let phys = self.rmtfs.phys;
+        let ipa_up = self.ipa_up;
+        let old = self.status;
+        let retained: Vec<Server> = if keep_adsp {
+            self.servers
+                .iter()
+                .copied()
+                .filter(|s| s.node != MODEM_NODE)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        *self = Self::new(images, phys);
+        self.ipa_up = ipa_up;
+        self.status.airplane = old.airplane;
+        self.status.ring = old.ring;
+        self.status.missed = old.missed;
+        self.status.generation = old.generation.wrapping_add(1);
+        self.status.revision = old.revision;
+        self.servers = retained;
+        for s in &self.servers {
+            if s.service == ssctl::SERVICE
+                && s.instance == qrtr::instance_word(ssctl::VERSION, ssctl::ADSP)
+            {
+                self.ssctl[1] = Some((s.node, s.port));
+            }
+        }
+    }
+
+    fn card_status(&mut self, p: &mut dyn Platform, m: &qmi::Msg) {
+        if let Some(c) = uim::card(m) {
+            self.status.sim = c.state;
+            self.status.pin_attempts = c.attempts;
+            self.pin_id = c.pin_id;
+            self.card = Some(match c.state {
+                modem_ipc::sim::ABSENT => 0,
+                modem_ipc::sim::ERROR => 2,
+                _ => 1,
+            });
+            self.maybe_online(p);
         }
     }
 
     /// The periodic work: NAS serving system and signal every 30 s. `now_ms` is any monotonic clock.
     pub fn tick(&mut self, p: &mut dyn Platform, now_ms: u64) {
+        self.now = now_ms;
+        if self.response_seen || self.heartbeat_at == 0 {
+            self.heartbeat_at = now_ms;
+            self.response_seen = false;
+        }
+        if self.radio_request.is_some() && now_ms.saturating_sub(self.radio_at) >= 15_000 {
+            self.radio_request = None;
+            self.status.pending = false;
+            self.status.result = -33;
+        }
+        if self
+            .command
+            .is_some_and(|(_, _, _, t)| now_ms.saturating_sub(t) >= 15_000)
+        {
+            self.command = None;
+            self.status.pending = false;
+            self.status.result = -33;
+        }
+        self.maybe_online(p);
         if !self.outbox.is_empty() && now_ms.saturating_sub(self.outbox_at) >= OUTBOX_RETRY_MS {
             self.outbox_at = now_ms;
             self.flush(p);
@@ -463,6 +713,14 @@ impl Modem {
         self.last_poll = now_ms;
         self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
         self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
+    }
+
+    /// Three missed 30-second NAS poll cycles: the transport may be alive while the modem is wedged.
+    pub fn watchdog(&self) -> bool {
+        !self.status.airplane
+            && self.clients.iter().any(|c| c.service == NAS)
+            && self.heartbeat_at != 0
+            && self.now.saturating_sub(self.heartbeat_at) > 90_000
     }
 
     /// The call can't stick (C6 2026-11-09: a hangup that never reached the modem left it "dialling" for good, and
@@ -493,15 +751,10 @@ impl Modem {
         }
     }
 
-    /// The modem died (SMP2P fatal): nothing it reported holds any more. The UI shows "No service".
-    /// shortcut: no restart (SSR) yet; a reboot brings the modem back.
+    /// Invalidate the protocol after processor loss; hardware must be stopped before reset/reload.
     pub fn lost(&mut self) {
-        self.status = Status {
-            modem: modem_ipc::modem::FAILED,
-            sim: self.status.sim,
-            ..Status::default()
-        };
-        self.clients.clear();
+        self.reset(false);
+        self.status.modem = modem_ipc::modem::FAILED;
     }
 
     /// Place a call (modem_ipc::op::DIAL). KErrArgument for a number [`voice::dialable`] refuses, KErrInUse while a
@@ -510,12 +763,20 @@ impl Modem {
         if !voice::dialable(number) {
             return Err(KERR_ARGUMENT);
         }
-        if !matches!(self.status.call.state, call::NONE | call::END) {
-            return Err(KERR_IN_USE);
-        }
-        if !self.request(p, VOICE, voice::DIAL, &[(0x01, number.as_bytes())]) {
+        if self.status.airplane {
             return Err(KERR_NOT_READY);
         }
+        if self
+            .status
+            .calls
+            .as_slice()
+            .iter()
+            .any(|c| !matches!(c.state, call::NONE | call::END | call::HOLD))
+            || (!matches!(self.status.call.state, call::NONE | call::END | call::HOLD))
+        {
+            return Err(KERR_IN_USE);
+        }
+        self.user_request(p, VOICE, voice::DIAL, &[(1, number.as_bytes())])?;
         self.hangup_pending = false;
         self.status.call = Call {
             id: 0,
@@ -723,7 +984,9 @@ impl Modem {
                 }
                 tftp::Action::Ignore => {}
             },
-            port if self.clients.iter().any(|c| c.port == port) => self.client(p, port, payload),
+            port if self.clients.iter().any(|c| c.port == port && c.dst == from) => {
+                self.client(p, port, payload)
+            }
             port => {
                 let Some(i) = self.transfers.iter().position(|t| t.port == port) else {
                     return;
@@ -764,6 +1027,7 @@ impl Modem {
                     return;
                 };
                 c.pending.remove(k);
+                self.response_seen = true;
                 self.response(p, service, &m);
             }
             qmi::INDICATION => self.indication(p, service, &m),
@@ -772,6 +1036,48 @@ impl Modem {
     }
 
     fn response(&mut self, p: &mut dyn Platform, service: u32, m: &qmi::Msg) {
+        if self
+            .command
+            .is_some_and(|(s, id, txn, _)| s == service && id == m.id && txn == m.txn)
+        {
+            self.command = None;
+            self.status.pending = false;
+            self.status.result = match m.result() {
+                Some(Ok(())) => 0,
+                Some(Err(e)) => -1000 - i32::from(e),
+                None => -20,
+            };
+        }
+        if (service, m.id) == (UIM, uim::VERIFY_PIN) {
+            if let Some(n) = m.u8(0x10) {
+                self.status.pin_attempts = n;
+                if n == 0 {
+                    self.status.sim = modem_ipc::sim::BLOCKED;
+                }
+            }
+            self.request(p, UIM, UIM_GET_CARD_STATUS, &[]);
+        }
+        if (service, m.id) == (DMS, DMS_SET_OPERATING_MODE)
+            && self.radio_request.is_some_and(|(txn, _)| txn == m.txn)
+        {
+            let (_, online) = self.radio_request.take().unwrap();
+            self.status.pending = self.command.is_some();
+            if m.result() == Some(Ok(())) {
+                self.status.radio_online = online;
+                self.status.modem = if online {
+                    modem_ipc::modem::ONLINE
+                } else {
+                    modem_ipc::modem::RUNNING
+                };
+                if !online {
+                    self.status.reg = modem_ipc::reg::NONE;
+                    self.status.rat = modem_ipc::rat::NONE;
+                    self.status.bars = 0;
+                }
+            } else {
+                self.status.result = -2;
+            }
+        }
         let text = |t: Option<&[u8]>| t.map(|b| String::from_utf8_lossy(b).into_owned());
         let Some(Ok(())) = m.result() else {
             p.log(format_args!(
@@ -799,23 +1105,8 @@ impl Modem {
                     self.imei.as_deref().map(mask).unwrap_or_default()
                 ));
             }
-            (DMS, DMS_SET_OPERATING_MODE) => {
-                self.status.modem = modem_ipc::modem::ONLINE;
-                p.log(format_args!("dms: online"));
-            }
-            (UIM, UIM_GET_CARD_STATUS) => {
-                // card status: 4 x u16 session indexes, a u8 card count, then per card its state first
-                self.card = m.tlv(0x10).and_then(|t| t.get(9)).copied();
-                let (sim, state) = match self.card {
-                    Some(0) => (modem_ipc::sim::ABSENT, "absent"),
-                    Some(1) => (modem_ipc::sim::PRESENT, "present"),
-                    Some(2) => (modem_ipc::sim::ERROR, "error"),
-                    _ => (modem_ipc::sim::UNKNOWN, "?"),
-                };
-                self.status.sim = sim;
-                p.log(format_args!("uim: card {state}"));
-                self.maybe_online(p);
-            }
+            (DMS, DMS_SET_OPERATING_MODE) => self.maybe_online(p),
+            (UIM, UIM_GET_CARD_STATUS) => self.card_status(p, m),
             (NAS, nas::GET_SERVING_SYSTEM) => self.serving(p, m),
             (NAS, nas::GET_SIGNAL_INFO) => self.signal(m),
             (NAS, nas::SET_SYSTEM_SELECTION) => p.log(format_args!("nas: voice-only mode set")),
@@ -849,32 +1140,69 @@ impl Modem {
         match (service, m.id) {
             (NAS, nas::GET_SERVING_SYSTEM) => self.serving(p, m),
             (NAS, nas::SIGNAL_INFO_IND) => self.signal(m),
+            (UIM, uim::STATUS_IND) => self.card_status(p, m),
             (VOICE, voice::ALL_CALL_STATUS_IND) => {
-                let Some(c) = voice::all_call_status(m) else {
+                let Some(calls) = voice::all_calls(m) else {
                     return;
                 };
-                let old = self.status.call;
-                let number = match c.number {
-                    Some(n) => Text::new(&n),
-                    None if old.id == c.id || old.id == 0 => old.number,
-                    None => Text::default(),
+                let old = self.status.calls;
+                let mut next = modem_ipc::Calls {
+                    len: calls.len() as u8,
+                    ..Default::default()
                 };
-                self.status.call = Call {
-                    id: c.id,
-                    state: c.state,
-                    incoming: c.incoming,
-                    number,
-                };
-                if (old.id, old.state) != (c.id, c.state) {
-                    p.log(format_args!(
-                        "voice: call {} state {} {} {}",
-                        c.id,
-                        c.state,
-                        if c.incoming { "from" } else { "to" },
-                        mask(number.as_str())
-                    ));
+                for (i, c) in calls.into_iter().enumerate() {
+                    let previous = old.find(c.id).copied().or_else(|| {
+                        (self.status.call.id == c.id || self.status.call.id == 0)
+                            .then_some(self.status.call)
+                    });
+                    next.entries[i] = Call {
+                        id: c.id,
+                        state: c.state,
+                        incoming: c.incoming,
+                        number: c.number.map_or_else(
+                            || previous.map_or(Text::default(), |x| x.number),
+                            |n| Text::new(&n),
+                        ),
+                    };
+                    if c.state == call::CONVERSATION && !self.answered.contains(&c.id) {
+                        self.answered.push(c.id);
+                    }
                 }
-                if self.hangup_pending && c.id != 0 {
+                for c in old.as_slice() {
+                    let ended = next.find(c.id).is_none_or(|n| n.state == call::END);
+                    if ended
+                        && c.incoming
+                        && !matches!(c.state, call::NONE | call::END)
+                        && !self.answered.contains(&c.id)
+                    {
+                        self.status.missed = self.status.missed.wrapping_add(1);
+                    }
+                }
+                self.answered
+                    .retain(|id| next.find(*id).is_some_and(|c| c.state != call::END));
+                self.status.calls = next;
+                // Incoming/waiting gets UI priority; audio independently scans the complete list.
+                self.status.call = next
+                    .as_slice()
+                    .iter()
+                    .min_by_key(|c| match c.state {
+                        call::INCOMING | call::WAITING => 0,
+                        call::CONVERSATION => 1,
+                        call::ORIGINATION | call::ALERTING | call::CC_IN_PROGRESS => 2,
+                        call::HOLD => 3,
+                        call::DISCONNECTING => 4,
+                        _ => 5,
+                    })
+                    .copied()
+                    .unwrap_or(Call {
+                        state: if self.status.call.state != call::NONE {
+                            call::END
+                        } else {
+                            call::NONE
+                        },
+                        ..self.status.call
+                    });
+                if self.hangup_pending && self.status.call.id != 0 {
                     self.hangup_pending = false;
                     let _ = self.hangup(p);
                 }
@@ -1342,7 +1670,7 @@ mod tests {
         m.handle(&mut f, &ns(UIM, 55));
         assert_eq!(
             req(f.sent.last().unwrap()),
-            (0x21, 55, UIM_GET_CARD_STATUS, 1)
+            (0x21, 55, UIM_GET_CARD_STATUS, 2)
         );
         // a response on a transaction we never sent is not ours
         let stray = ok(9, UIM_GET_CARD_STATUS)
@@ -1350,7 +1678,7 @@ mod tests {
             .finish();
         m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, 0x21, &stray));
         assert_eq!(m.card, None);
-        let card = ok(1, UIM_GET_CARD_STATUS)
+        let card = ok(2, UIM_GET_CARD_STATUS)
             .tlv(0x10, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1])
             .finish();
         m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, 0x21, &card));
@@ -1689,5 +2017,189 @@ mod tests {
             qrtr::ctrl_words(qrtr::decode(&f.sent[1]).unwrap().1),
             Some((4, [0; 4]))
         );
+    }
+    fn call_ind(calls: &[u8]) -> Vec<u8> {
+        from_modem(
+            qrtr::TYPE_DATA,
+            77,
+            0x23,
+            &qmi::Builder::new(qmi::INDICATION, 1, voice::ALL_CALL_STATUS_IND)
+                .tlv(1, calls)
+                .finish(),
+        )
+    }
+
+    #[test]
+    fn complete_call_list_survives_reorder_and_end_of_one_call() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 1, 3, 0, 1, 3, 0, 0, 2, 7, 0, 2, 3, 0, 0]),
+        );
+        assert_eq!(m.status.calls.len, 2);
+        assert_eq!(m.status.call.id, 2);
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 2, 7, 0, 2, 3, 0, 0, 1, 3, 0, 1, 3, 0, 0]),
+        );
+        assert_eq!(m.status.calls.find(1).unwrap().state, call::CONVERSATION);
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 2, 9, 0, 2, 3, 0, 0, 1, 3, 0, 1, 3, 0, 0]),
+        );
+        assert_eq!(m.status.call.id, 1);
+        assert_eq!(m.status.missed, 1);
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 2, 9, 0, 2, 3, 0, 0, 1, 3, 0, 1, 3, 0, 0]),
+        );
+        assert_eq!(m.status.missed, 1);
+    }
+
+    #[test]
+    fn manage_error_and_timeout_do_not_change_modem_reported_state() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(&mut f, &call_ind(&[1, 1, 3, 0, 1, 3, 0, 0]));
+        m.manage(&mut f, modem_ipc::manage::HOLD, 1).unwrap();
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(id, voice::MANAGE_CALLS);
+        assert!(m.status.pending);
+        assert_eq!(m.status.call.state, call::CONVERSATION);
+        let failure = qmi::Builder::new(qmi::RESPONSE, txn, id).result(3).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 77, 0x23, &failure));
+        assert!(!m.status.pending);
+        assert_eq!(m.status.result, -1003);
+        assert_eq!(m.status.call.state, call::CONVERSATION);
+        m.manage(&mut f, modem_ipc::manage::HOLD, 1).unwrap();
+        m.tick(&mut f, 15_000);
+        assert!(!m.status.pending);
+        assert_eq!(m.status.result, -33);
+    }
+
+    #[test]
+    fn reset_retains_ram_efs_intent_and_healthy_adsp_ssctl() {
+        let (mut m, mut f) = (modem(), fake());
+        m.rmtfs.images[0][0] = 99;
+        m.status.airplane = true;
+        m.status.ring.silent = true;
+        m.handle(&mut f, &ssctl_ns(2, ssctl::ADSP, 90));
+        m.reset(true);
+        assert_eq!(m.rmtfs.images[0][0], 99);
+        assert!(m.status.airplane && m.status.ring.silent);
+        assert_eq!(m.status.generation, 1);
+        f.sent.clear();
+        m.handle(&mut f, &ssctl_ns(0, ssctl::MODEM, 91));
+        assert_eq!(f.sent.len(), 2); // retained ADSP need not announce again
+        assert_eq!(
+            f.nodes.iter().rev().take(2).copied().collect::<Vec<_>>(),
+            [2, 0]
+        );
+        m.reset(false);
+        assert!(m.servers.is_empty());
+        assert!(m.ssctl.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn airplane_confirmation_never_claims_online_and_survives_sim_events() {
+        let (mut m, mut f) = (modem(), fake());
+        m.status.airplane = true;
+        m.handle(&mut f, &ns(DMS, 68));
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(id, DMS_SET_OPERATING_MODE);
+        let (_, payload) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        assert_eq!(qmi::Msg::parse(payload).unwrap().tlv(1), Some(&[1][..]));
+        m.handle(
+            &mut f,
+            &from_modem(qrtr::TYPE_DATA, 68, 0x20, &ok(txn, id).finish()),
+        );
+        assert!(!m.status.radio_online);
+        assert!(!m.status.pending);
+        m.handle(&mut f, &ns(UIM, 55));
+        let c = qmi::Builder::new(qmi::INDICATION, 1, uim::STATUS_IND)
+            .tlv(0x10, &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1])
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, 0x21, &c));
+        m.tick(&mut f, 5000);
+        assert!(!m.status.radio_online && m.status.airplane);
+        m.reset(true);
+        assert!(m.status.airplane);
+    }
+
+    #[test]
+    fn rejected_pin_updates_attempts_and_is_never_retried() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(UIM, 55));
+        m.status.sim = modem_ipc::sim::PIN_REQUIRED;
+        assert_eq!(m.verify_pin(&mut f, b"123"), Err(KERR_ARGUMENT));
+        m.verify_pin(&mut f, b"1234").unwrap();
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(id, uim::VERIFY_PIN);
+        let (_, payload) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        assert_eq!(qmi::Msg::parse(payload).unwrap().tlv(1), Some(&[6, 0][..]));
+        let rejected = qmi::Builder::new(qmi::RESPONSE, txn, id)
+            .result(12)
+            .tlv(0x10, &[0, 10])
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 55, 0x21, &rejected));
+        assert_eq!(m.status.sim, modem_ipc::sim::BLOCKED);
+        assert_eq!(m.status.pin_attempts, 0);
+        let count = f
+            .sent
+            .iter()
+            .filter(|p| req(p).2 == uim::VERIFY_PIN)
+            .count();
+        m.tick(&mut f, 60_000);
+        assert_eq!(
+            f.sent
+                .iter()
+                .filter(|p| qmi::Msg::parse(qrtr::decode(p).unwrap().1)
+                    .is_some_and(|q| q.id == uim::VERIFY_PIN))
+                .count(),
+            count
+        );
+        assert_eq!(m.verify_pin(&mut f, b"1234"), Err(KERR_NOT_READY));
+    }
+    #[test]
+    fn cancel_before_delayed_dial_response_sends_end_with_assigned_id() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.dial(&mut f, "+37400000001").unwrap();
+        let (_, _, _, txn) = req(f.sent.last().unwrap());
+        assert_eq!(m.status.call.id, 0);
+        assert!(m.status.pending);
+        assert_eq!(m.end_call(&mut f, 0), Ok(()));
+        assert!(m.hangup_pending);
+        let response = ok(txn, voice::DIAL).u8(0x10, 7).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 77, 0x23, &response));
+        let (_, _, id, _) = req(f.sent.last().unwrap());
+        assert_eq!(id, voice::END);
+        let (_, p) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        assert_eq!(qmi::Msg::parse(p).unwrap().tlv(1), Some(&[7][..]));
+        assert_eq!(m.status.call.state, call::DISCONNECTING);
+    }
+
+    #[test]
+    fn watchdog_detects_three_lost_poll_cycles_but_not_airplane_idle() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(NAS, 70));
+        m.tick(&mut f, 1);
+        assert!(!m.watchdog());
+        m.tick(&mut f, 90_002);
+        assert!(m.watchdog());
+        m.status.airplane = true;
+        assert!(!m.watchdog());
+    }
+    #[test]
+    fn cancel_after_dial_indication_before_response_sends_end() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.dial(&mut f, "+37400000001").unwrap();
+        m.handle(&mut f, &call_ind(&[1, 7, 1, 0, 1, 3, 0, 0]));
+        assert!(m.status.pending);
+        assert_eq!(m.status.call.id, 7);
+        assert_eq!(m.end_call(&mut f, 7), Ok(()));
+        assert_eq!(req(f.sent.last().unwrap()).2, voice::END);
     }
 }

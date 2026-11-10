@@ -15,6 +15,44 @@ const DOMAIN_ADSP: u8 = 4;
 const DOMAIN_APPS: u8 = 5;
 pub const SVC_CORE: u8 = 3;
 pub const SVC_AFE: u8 = 4;
+pub const SVC_ASM: u8 = 7;
+pub const SVC_ADM: u8 = 8;
+// Wire facts: Linux sound/soc/qcom/qdsp6/{q6asm,q6adm}.c. Original encoder below.
+const ASM_MAP: u32 = 0x10d92;
+const ASM_MAP_RSP: u32 = 0x10d93;
+const ASM_UNMAP: u32 = 0x10d94;
+const ASM_OPEN: u32 = 0x10db3;
+const ASM_FMT: u32 = 0x10d98;
+const ASM_RUN: u32 = 0x10daa;
+const ASM_WRITE: u32 = 0x10dab;
+const ASM_WRITTEN: u32 = 0x10d99;
+const ASM_PAUSE: u32 = 0x10bd3;
+const ASM_CLOSE: u32 = 0x10bcd;
+const ADM_OPEN: u32 = 0x10326;
+const ADM_OPEN_RSP: u32 = 0x10329;
+const ADM_CLOSE: u32 = 0x10327;
+const ADM_ROUTE: u32 = 0x10325;
+const RING_PORT: u16 = 0x0101;
+pub const RING_BYTES: usize = 48_000;
+
+/// Original two-pulse triangle ringtone: 48kHz signed mono PCM16, half a second.
+/// PCM level carries ring volume so voice volume remains untouched.
+pub fn ring_pcm(volume: u8) -> Vec<u8> {
+    let mut b = Vec::with_capacity(RING_BYTES);
+    for i in 0..RING_BYTES / 2 {
+        let within = i % 12_000;
+        let env = if within < 7200 {
+            within.min(7200 - within).min(480) as i32
+        } else {
+            0
+        };
+        let phase = (i % 80) as i32;
+        let triangle = if phase < 40 { phase - 20 } else { 60 - phase };
+        let sample = (triangle * 600 * env * i32::from(volume.min(10)) / 480 / 10) as i16;
+        b.extend_from_slice(&sample.to_le_bytes());
+    }
+    b
+}
 pub const SVC_MVM: u8 = 9;
 pub const SVC_CVP: u8 = 0x0b;
 const HDR_FIELD_SEQ_CMD: u16 = 0x0250;
@@ -289,6 +327,18 @@ enum Cmd {
     Voice(bool),
     Destroy(u8),
     Loopback(bool),
+    AsmMap,
+    AsmOpen,
+    AsmFormat,
+    AdmOpen,
+    AdmRoute,
+    AsmRun,
+    Publish,
+    AsmWrite,
+    AsmPause,
+    AsmClose,
+    AsmUnmap,
+    AdmClose,
 }
 
 /// What the daemon does next.
@@ -298,6 +348,10 @@ pub enum Out {
     Send(Vec<u8>),
     /// power the codecs and amps (true) or stop them, then call `codecs_done`
     Codecs(bool),
+    /// Publish the already copied PCM region; call publish_done after the HAL barrier.
+    Publish,
+    /// A matching DSP write completion relinquished this exact publication.
+    Complete(u32, u32),
     Nothing,
 }
 
@@ -308,6 +362,7 @@ pub enum Mode {
     Off,
     Call,
     Test,
+    Ring,
 }
 
 /// The audio state machine. Callers only say what they want ([`Audio::set`]); a running sequence is never cut
@@ -326,9 +381,56 @@ pub struct Audio {
     /// the mode the last queued sequence leads to
     is: Mode,
     pub failures: u32,
+    broken: bool,
+    pub pcm_phys: u32,
+    pub pcm_generation: u32,
+    map_handle: u32,
+    copp: u16,
+    ticket: u32,
+    release: bool,
+    last_token: u32,
 }
 
 impl Audio {
+    /// A transport refusal is known-unsent: retry this command, never advance it.
+    pub fn send_refused(&mut self) {
+        self.waiting = None;
+    }
+    pub fn failed_hard(&self) -> bool {
+        self.broken
+    }
+    /// Live board controls can stop the codecs on an I/O failure. The old APR
+    /// sessions must not remain reported as running; only processor recovery clears this.
+    pub fn codec_fault(&mut self) {
+        self.broken = true;
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    pub fn running(&self) -> bool {
+        self.is != Mode::Off && self.idle() && !self.broken
+    }
+
+    /// Off alone includes an in-flight teardown. Only this predicate permits retaining the DSP.
+    pub fn quiescent(&self) -> bool {
+        self.is == Mode::Off && self.idle() && !self.broken && !self.release
+    }
+    pub fn publish_done(&mut self, result: Result<u32, i32>) {
+        if self.queue.get(self.at) != Some(&Cmd::Publish) {
+            return;
+        }
+        match result {
+            Ok(ticket) => {
+                self.ticket = ticket;
+                self.waiting = None;
+                self.at += 1;
+            }
+            Err(_) => {
+                self.broken = true;
+                self.failures += 1;
+            }
+        }
+    }
+
     pub fn set(&mut self, want: Mode) {
         self.want = want;
     }
@@ -374,6 +476,27 @@ impl Audio {
                 q.extend(spk);
                 q.push(Loopback(true));
             }
+            Mode::Ring => {
+                q = alloc::vec![
+                    CoreReady,
+                    Clock(SPK),
+                    TdmConfig(SPK),
+                    SlotMap(SPK),
+                    Port(SPK, true),
+                    AsmMap,
+                    AsmOpen,
+                    AsmFormat,
+                    AdmOpen,
+                    AdmRoute,
+                    Codecs(true),
+                    AsmRun,
+                    Publish,
+                    AsmWrite
+                ];
+                if self.pcm_phys == 0 {
+                    self.broken = true;
+                }
+            }
             Mode::Off => q.clear(),
         }
         self.queue = q;
@@ -411,6 +534,14 @@ impl Audio {
                 Codecs(false),
                 Port(SPK, false),
                 Port(MIC, false),
+            ]),
+            Mode::Ring => q.extend([
+                AsmPause,
+                AsmClose,
+                AsmUnmap,
+                AdmClose,
+                Codecs(false),
+                Port(SPK, false),
             ]),
             Mode::Off => {}
         }
@@ -467,18 +598,115 @@ impl Audio {
                 &[],
             ),
             Loopback(on) => afe_loopback(on),
-            Codecs(_) => Vec::new(),
+            AsmMap => {
+                let mut v = Vec::new();
+                v.extend_from_slice(&3u16.to_le_bytes());
+                v.extend_from_slice(&1u16.to_le_bytes());
+                for w in [0, self.pcm_phys, 0, 65_536] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                packet(SVC_ASM, 0, 0, 0x100, ASM_MAP, &v)
+            }
+            AsmOpen => {
+                let mut v = Vec::new();
+                v.extend_from_slice(&0u32.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                for w in [0x10c68u32, 0x10da5] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_OPEN, &v)
+            }
+            AsmFormat => {
+                let mut v = Vec::new();
+                v.extend_from_slice(&20u32.to_le_bytes());
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&48_000u32.to_le_bytes());
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&0u16.to_le_bytes());
+                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+                packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_FMT, &v)
+            }
+            AdmOpen => {
+                let mut v = Vec::new();
+                for h in [0u16, 1, SPK.1, 0] {
+                    v.extend_from_slice(&h.to_le_bytes());
+                }
+                v.extend_from_slice(&0x10312u32.to_le_bytes()); // ADM NULL_COPP_TOPOLOGY (no effects)
+                v.extend_from_slice(&1u16.to_le_bytes());
+                v.extend_from_slice(&16u16.to_le_bytes());
+                v.extend_from_slice(&48_000u32.to_le_bytes());
+                v.extend_from_slice(&[3, 0, 0, 0, 0, 0, 0, 0]);
+                packet(SVC_ADM, SPK.1, SPK.1, u32::from(SPK.0) << 16, ADM_OPEN, &v)
+            }
+            AdmRoute => {
+                let mut v = Vec::new();
+                for w in [0u32, 1] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                for h in [1u16, 1, self.copp, 0] {
+                    v.extend_from_slice(&h.to_le_bytes());
+                }
+                packet(SVC_ADM, 0, 0, 0, ADM_ROUTE, &v)
+            }
+            AsmRun => packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_RUN, &[0; 12]),
+            AsmWrite => {
+                let mut v = Vec::new();
+                for w in [
+                    self.pcm_phys,
+                    0,
+                    self.map_handle,
+                    RING_BYTES as u32,
+                    self.ticket,
+                    0,
+                    0,
+                    0,
+                ] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                packet(SVC_ASM, RING_PORT, RING_PORT, self.ticket, ASM_WRITE, &v)
+            }
+            AsmPause => packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_PAUSE, &[]),
+            AsmClose => packet(SVC_ASM, RING_PORT, RING_PORT, 1, ASM_CLOSE, &[]),
+            AsmUnmap => packet(
+                SVC_ASM,
+                0,
+                0,
+                0x100,
+                ASM_UNMAP,
+                &self.map_handle.to_le_bytes(),
+            ),
+            AdmClose => packet(
+                SVC_ADM,
+                SPK.1,
+                self.copp,
+                u32::from(SPK.0) << 16,
+                ADM_CLOSE,
+                &[],
+            ),
+            Codecs(_) | Publish => Vec::new(),
         }
     }
 
     /// The next thing to do at `now` (ms); `log` hears about failures and timeouts.
     pub fn poll(&mut self, now: u64, log: &mut dyn FnMut(core::fmt::Arguments)) -> Out {
+        if self.release {
+            self.release = false;
+            return Out::Complete(self.ticket, self.pcm_generation);
+        }
+        if self.broken {
+            return Out::Nothing;
+        }
         if let Some((op, t)) = self.waiting {
             if now.saturating_sub(t) < ACK_TIMEOUT_MS {
                 return Out::Nothing;
             }
             log(format_args!("apr: no answer to {:#x}", op));
             self.failed(log);
+            if self.broken {
+                return Out::Nothing;
+            }
         }
         if self.idle() && self.want != self.is {
             if self.is == Mode::Off {
@@ -489,14 +717,23 @@ impl Audio {
                 self.end();
             }
         }
+        if self.idle() && self.is == Mode::Ring && self.want == Mode::Ring {
+            self.queue = alloc::vec![Cmd::Publish, Cmd::AsmWrite];
+            self.at = 0;
+        }
         let Some(&c) = self.queue.get(self.at) else {
             return Out::Nothing;
         };
+        if c == Cmd::Publish {
+            self.waiting = Some((0, now));
+            return Out::Publish;
+        }
         if let Cmd::Codecs(on) = c {
             self.waiting = Some((0, now));
             return Out::Codecs(on);
         }
         let p = self.packet(c);
+        self.last_token = u32::from_le_bytes(p[12..16].try_into().unwrap());
         self.waiting = Some((u32::from_le_bytes([p[16], p[17], p[18], p[19]]), now));
         Out::Send(p)
     }
@@ -506,10 +743,10 @@ impl Audio {
         if matches!(self.waiting, Some((0, _))) {
             self.waiting = None;
             if !ok {
-                log(format_args!(
-                    "apr: the codecs failed; the voice path goes on"
-                ));
+                log(format_args!("apr: codecs failed; recovery required"));
                 self.failures += 1;
+                self.broken = true;
+                return;
             }
             self.at += 1;
         }
@@ -523,9 +760,15 @@ impl Audio {
             Some(Cmd::MvmCreate) | Some(Cmd::CvpCreate) => {
                 log(format_args!("apr: no voice session; stopping the sequence"));
                 self.at = self.queue.len();
+                self.broken = true;
             }
             Some(Cmd::CoreReady) if self.core_tries < CORE_TRIES => self.core_tries += 1, // again next poll
-            _ => self.at += 1,
+            _ => {
+                self.broken = true;
+                log(format_args!(
+                    "apr: uncertain audio state; recovery required"
+                ));
+            }
         }
     }
 
@@ -539,6 +782,88 @@ impl Audio {
             return; // an event, or a late answer
         };
         let current = self.queue.get(self.at).copied();
+        if matches!(
+            current,
+            Some(
+                Cmd::AsmMap
+                    | Cmd::AsmOpen
+                    | Cmd::AsmFormat
+                    | Cmd::AdmOpen
+                    | Cmd::AdmRoute
+                    | Cmd::AsmRun
+                    | Cmd::AsmWrite
+                    | Cmd::AsmPause
+                    | Cmd::AsmClose
+                    | Cmd::AsmUnmap
+                    | Cmd::AdmClose
+            )
+        ) {
+            let expected = if matches!(current, Some(Cmd::AdmOpen | Cmd::AdmRoute | Cmd::AdmClose))
+            {
+                SVC_ADM
+            } else {
+                SVC_ASM
+            };
+            if r.svc != expected || r.token != self.last_token {
+                return;
+            }
+            if current == Some(Cmd::AsmMap) && r.opcode == ASM_MAP_RSP {
+                self.map_handle = r
+                    .payload
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .unwrap_or(0);
+                if self.map_handle == 0 {
+                    self.failed(log);
+                } else {
+                    self.waiting = None;
+                    self.at += 1;
+                }
+                return;
+            }
+            if current == Some(Cmd::AdmOpen) && r.opcode == ADM_OPEN_RSP {
+                let status = r
+                    .payload
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                let copp = r
+                    .payload
+                    .get(4..6)
+                    .map(|b| u16::from_le_bytes(b.try_into().unwrap()));
+                if status != Some(0) || copp.is_none_or(|c| c == 255) {
+                    self.failed(log);
+                } else {
+                    self.copp = copp.unwrap();
+                    self.waiting = None;
+                    self.at += 1;
+                }
+                return;
+            }
+            if current == Some(Cmd::AsmWrite) && r.opcode == ASM_WRITTEN {
+                let addr = r
+                    .payload
+                    .get(..4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                let high = r
+                    .payload
+                    .get(4..8)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+                if addr != Some(self.pcm_phys) || high != Some(0) {
+                    self.failed(log);
+                    return;
+                }
+                self.release = true;
+                self.waiting = None;
+                self.at += 1;
+                return;
+            }
+            // MAP/OPEN return handles in dedicated replies; basic success is not completion.
+            if matches!(current, Some(Cmd::AsmMap | Cmd::AdmOpen | Cmd::AsmWrite))
+                && r.result().is_some_and(|(_, s)| s == 0)
+            {
+                return;
+            }
+        }
         if current == Some(Cmd::CoreReady) {
             let state = r
                 .payload
@@ -553,7 +878,7 @@ impl Audio {
                         log(format_args!(
                             "apr: the ADSP's core never got ready; going on"
                         ));
-                        self.at += 1;
+                        self.broken = true;
                     }
                     return;
                 }
@@ -710,6 +1035,8 @@ mod tests {
                     codecs.push(on);
                     a.codecs_done(true, &mut log);
                 }
+                Out::Publish => panic!("voice/test must never publish PCM"),
+                Out::Complete(_, _) => panic!("voice/test must never complete PCM"),
                 Out::Nothing => {}
             }
         }
@@ -859,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unanswered_command_times_out_and_the_sequence_goes_on() {
+    fn an_unanswered_command_requires_recovery() {
         let mut a = Audio::default();
         let mut n = 0;
         let mut log = |_: core::fmt::Arguments| n += 1;
@@ -868,7 +1195,175 @@ mod tests {
         a.at = 1; // past the core check
         assert!(matches!(a.poll(0, &mut log), Out::Send(_)));
         assert_eq!(a.poll(2000, &mut log), Out::Nothing);
-        assert!(matches!(a.poll(3000, &mut log), Out::Send(_)));
-        assert_eq!((a.at, a.failures), (2, 1));
+        assert_eq!(a.poll(3000, &mut log), Out::Nothing);
+        assert_eq!((a.at, a.failures, a.failed_hard()), (1, 1, true));
+    }
+    fn ring_response(a: &mut Audio, p: &[u8]) {
+        let op = u32::from_le_bytes(p[16..20].try_into().unwrap());
+        let token = u32::from_le_bytes(p[12..16].try_into().unwrap());
+        let mut log = |_: core::fmt::Arguments| {};
+        let mut r = match op {
+            CORE_GET_STATE => packet(
+                SVC_CORE,
+                0,
+                0,
+                token,
+                CORE_GET_STATE_RSP,
+                &1u32.to_le_bytes(),
+            ),
+            ASM_MAP => packet(SVC_ASM, 0, 0, token, ASM_MAP_RSP, &88u32.to_le_bytes()),
+            ADM_OPEN => packet(
+                SVC_ADM,
+                0,
+                0,
+                token,
+                ADM_OPEN_RSP,
+                &[0, 0, 0, 0, 9, 0, 0, 0],
+            ),
+            ASM_WRITE => {
+                let mut payload = Vec::new();
+                for w in [a.pcm_phys, 0, a.map_handle, 0] {
+                    payload.extend_from_slice(&w.to_le_bytes());
+                }
+                packet(SVC_ASM, RING_PORT, RING_PORT, token, ASM_WRITTEN, &payload)
+            }
+            _ => ack(
+                p,
+                if op == MVM_CREATE_PASSIVE {
+                    0x11
+                } else if op == CVP_CREATE_V3 {
+                    0x22
+                } else {
+                    0
+                },
+                0,
+            ),
+        };
+        r[4] = p[8];
+        r[5] = DOMAIN_ADSP;
+        a.handle(&r, &mut log);
+    }
+
+    #[test]
+    fn ringtone_stops_and_unmaps_before_call_audio() {
+        let mut a = Audio {
+            pcm_phys: 0x90000000,
+            pcm_generation: 4,
+            ..Default::default()
+        };
+        a.set(Mode::Ring);
+        let mut ops = Vec::new();
+        let mut ticket = 0;
+        let mut completed = false;
+        let mut log = |_: core::fmt::Arguments| {};
+        for now in 0..200 {
+            match a.poll(now, &mut log) {
+                Out::Send(p) => {
+                    let op = u32::from_le_bytes(p[16..20].try_into().unwrap());
+                    ops.push(op);
+                    ring_response(&mut a, &p);
+                    if op == ASM_WRITE {
+                        a.set(Mode::Call);
+                    }
+                }
+                Out::Publish => {
+                    ticket += 1;
+                    a.publish_done(Ok(ticket));
+                }
+                Out::Complete(t, g) => {
+                    assert_eq!((t, g), (ticket, 4));
+                    completed = true;
+                }
+                Out::Codecs(_) => a.codecs_done(true, &mut log),
+                Out::Nothing => {}
+            }
+        }
+        assert!(completed);
+        assert!(a.idle() && a.is() == Mode::Call && !a.failed_hard());
+        let close = ops.iter().position(|o| *o == ASM_CLOSE).unwrap();
+        let unmap = ops.iter().position(|o| *o == ASM_UNMAP).unwrap();
+        let voice = ops.iter().position(|o| *o == MVM_START).unwrap();
+        assert!(close < unmap && unmap < voice);
+    }
+
+    #[test]
+    fn stale_pcm_completion_cannot_release_new_publication() {
+        let mut a = Audio {
+            pcm_phys: 0x90000000,
+            pcm_generation: 4,
+            ..Default::default()
+        };
+        a.queue = alloc::vec![Cmd::Publish, Cmd::AsmWrite];
+        a.is = Mode::Ring;
+        a.want = Mode::Ring;
+        let mut log = |_: core::fmt::Arguments| {};
+        assert_eq!(a.poll(0, &mut log), Out::Publish);
+        a.publish_done(Ok(42));
+        let Out::Send(p) = a.poll(1, &mut log) else {
+            panic!()
+        };
+        let mut bad = packet(SVC_ASM, RING_PORT, RING_PORT, 41, ASM_WRITTEN, &[0; 16]);
+        bad[4] = SVC_ASM;
+        a.handle(&bad, &mut log);
+        assert!(a.waiting.is_some());
+        assert!(!a.release);
+        ring_response(&mut a, &p);
+        assert_eq!(a.poll(2, &mut log), Out::Complete(42, 4));
+    }
+
+    #[test]
+    fn unsent_command_is_retried_and_failed_codecs_require_recovery() {
+        let mut a = Audio::default();
+        a.set(Mode::Call);
+        let mut log = |_: core::fmt::Arguments| {};
+        let first = a.poll(0, &mut log);
+        a.send_refused();
+        assert_eq!(a.poll(1, &mut log), first);
+        a.queue = alloc::vec![Cmd::Codecs(true)];
+        a.at = 0;
+        a.waiting = Some((0, 2));
+        a.codecs_done(false, &mut log);
+        assert!(a.failed_hard());
+        assert_eq!(a.poll(3, &mut log), Out::Nothing);
+    }
+
+    #[test]
+    fn builtin_pcm_is_bounded_and_silent_at_zero() {
+        assert_eq!(ring_pcm(0), alloc::vec![0;RING_BYTES]);
+        let b = ring_pcm(10);
+        assert_eq!(b.len(), RING_BYTES);
+        assert!(
+            b.chunks_exact(2)
+                .map(|s| i16::from_le_bytes(s.try_into().unwrap()))
+                .all(|s| s.abs() <= 12_000)
+        );
+    }
+    #[test]
+    fn off_during_teardown_does_not_permit_modem_only_recovery() {
+        let mut a = Audio::default();
+        assert!(a.quiescent());
+        a.set(Mode::Call);
+        drive(&mut a, 0);
+        a.set(Mode::Off);
+        assert_eq!(a.poll(101, &mut |_| {}), Out::Codecs(false));
+        assert_eq!(a.is(), Mode::Off);
+        assert!(!a.quiescent());
+        a.codecs_done(true, &mut |_| {});
+        drive(&mut a, 102);
+        assert!(a.quiescent());
+    }
+    #[test]
+    fn failed_live_codec_control_invalidates_running_audio_until_recovery() {
+        let mut a = Audio::default();
+        a.set(Mode::Call);
+        drive(&mut a, 0);
+        assert!(a.running());
+        a.codec_fault();
+        assert!(!a.running());
+        assert!(!a.quiescent());
+        assert!(a.failed_hard());
+        assert_eq!(a.poll(200, &mut |_| {}), Out::Nothing);
+        // A fresh owner is created only after the kernel confirms DSP stop.
+        assert!(Audio::default().quiescent());
     }
 }

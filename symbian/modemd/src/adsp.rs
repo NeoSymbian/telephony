@@ -60,7 +60,7 @@ fn adsp_load(op: u32, seg: usize, offset: u32, data: &[u8]) -> i32 {
 }
 
 /// step, error, SMP2P slave-kernel bits, open channels (bit 0 IPCRTR, bit 1 APR)
-fn state() -> [u32; 4] {
+pub fn processor_state() -> [u32; 4] {
     let mut s = [0u32; 4];
     crate::hal(ADSP_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
     s
@@ -159,7 +159,7 @@ impl Adsp {
                 }
             },
             Adsp::Booting(t0) => {
-                let s = state();
+                let s = processor_state();
                 if s[1] != 0 {
                     dprintln!(
                         "[modemd] adsp: boot failed (step {}, error {})",
@@ -310,6 +310,8 @@ pub struct CallAudio {
     pub speaker: bool,
     pub volume: u8,
     pub test: Option<bool>,
+    pub ring: modem_proto::modem_ipc::Ring,
+    ring_loaded: bool,
 }
 
 impl CallAudio {
@@ -320,11 +322,44 @@ impl CallAudio {
             speaker: false,
             volume: 10,
             test: None,
+            ring: Default::default(),
+            ring_loaded: false,
         }
+    }
+
+    /// Prepare the bounded kernel region once before opening a ringtone stream. It is never copied while published.
+    pub fn prepare_ring(&mut self) -> Result<(), i32> {
+        if self.ring_loaded {
+            return Ok(());
+        }
+        let (r, info) = hal_io(0x4e1c, Io::default());
+        if r < 0 {
+            return Err(r);
+        }
+        let pcm = modem_proto::apr::ring_pcm(self.ring.volume);
+        let (r, _) = hal_io(
+            0x4e1c,
+            Io {
+                a: 1,
+                b: 0,
+                len: pcm.len() as u32,
+                buf: pcm.as_ptr() as u32,
+            },
+        );
+        if r < 0 {
+            return Err(r);
+        }
+        self.apr.pcm_phys = info.b;
+        self.apr.pcm_generation = info.buf;
+        self.ring_loaded = true;
+        Ok(())
     }
 
     /// Answers from the ADSP, then whatever the sequence does next (a packet out, or the codecs).
     pub fn pump(&mut self, buf: &mut [u8]) {
+        if self.apr.is() == Mode::Off && self.apr.idle() {
+            self.ring_loaded = false;
+        }
         let mut log = |a: core::fmt::Arguments| dprintln!("[modemd] {}", a);
         while let Some(n) = recv(RING_APR, buf) {
             self.apr.handle(&buf[..n], &mut log);
@@ -334,14 +369,56 @@ impl CallAudio {
                 modem_proto::apr::Out::Send(p) => {
                     if let Err(e) = send(RING_APR, &p) {
                         dprintln!("[modemd] apr: send failed ({})", e);
+                        self.apr.send_refused();
                     }
                     return; // its answer comes on a later step
                 }
+                modem_proto::apr::Out::Publish => {
+                    let (r, info) = hal_io(
+                        0x4e1c,
+                        Io {
+                            a: 2,
+                            ..Io::default()
+                        },
+                    );
+                    self.apr
+                        .publish_done(if r < 0 { Err(r) } else { Ok(info.b) });
+                    if r < 0 {
+                        return;
+                    }
+                }
+                modem_proto::apr::Out::Complete(ticket, generation) => {
+                    let r = hal_io(
+                        0x4e1c,
+                        Io {
+                            a: 3,
+                            b: ticket,
+                            buf: generation,
+                            ..Io::default()
+                        },
+                    )
+                    .0;
+                    if r < 0 {
+                        dprintln!("[modemd] PCM completion failed {}", r);
+                        return;
+                    }
+                }
                 modem_proto::apr::Out::Codecs(on) => {
                     let r = if on {
-                        audio(4, self.volume as u32);
-                        audio(5, self.muted as u32);
-                        audio(1, self.loudspeaker() as u32)
+                        let v = if self.apr.is() == Mode::Ring {
+                            self.ring.volume
+                        } else {
+                            self.volume
+                        };
+                        let r = audio(4, v as u32);
+                        let mute = audio(5, self.muted as u32);
+                        if r < 0 {
+                            r
+                        } else if mute < 0 {
+                            mute
+                        } else {
+                            audio(1, self.loudspeaker() as u32)
+                        }
                     } else {
                         audio(2, 0)
                     };
@@ -361,6 +438,7 @@ impl CallAudio {
     pub fn loudspeaker(&self) -> bool {
         match self.apr.is() {
             Mode::Test => self.test.unwrap_or(true),
+            Mode::Ring => true,
             _ => self.speaker,
         }
     }
@@ -368,7 +446,7 @@ impl CallAudio {
     /// What NeoModem reports: `on` only for a call's audio (the volume keys act on it), never the test.
     pub fn status(&self) -> modem_proto::modem_ipc::Audio {
         modem_proto::modem_ipc::Audio {
-            on: self.apr.is() == Mode::Call,
+            on: self.apr.is() == Mode::Call && self.apr.running(),
             muted: self.muted,
             speaker: self.speaker,
             volume: self.volume,
