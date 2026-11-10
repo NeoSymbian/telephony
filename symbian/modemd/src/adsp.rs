@@ -326,7 +326,10 @@ impl CallAudio {
     /// Answers from the ADSP, then whatever the sequence does next (a packet out, or the codecs).
     pub fn pump(&mut self, buf: &mut [u8]) {
         let mut log = |a: core::fmt::Arguments| dprintln!("[modemd] {}", a);
-        while let Some(n) = recv(RING_APR, buf) {
+        for _ in 0..32 {
+            let Some(n) = recv(RING_APR, buf) else {
+                break;
+            };
             self.apr.handle(&buf[..n], &mut log);
         }
         loop {
