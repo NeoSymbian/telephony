@@ -13,6 +13,7 @@ pub mod locator;
 pub mod nas;
 pub mod qmi;
 pub mod qrtr;
+pub mod recovery;
 pub mod rmtfs;
 pub mod ssctl;
 pub mod tftp;
@@ -77,6 +78,7 @@ const DMS_SET_OPERATING_MODE: u16 = 0x2e;
 const UIM_GET_CARD_STATUS: u16 = 0x2f;
 /// NAS polls, as ModemManager does (indications cover the rest)
 const POLL_MS: u64 = 30_000;
+const POST_CALL_MS: u64 = 30_000;
 pub const KERR_NOT_READY: i32 = -18;
 pub const KERR_ARGUMENT: i32 = -6;
 pub const KERR_IN_USE: i32 = -14;
@@ -135,6 +137,8 @@ pub struct Modem {
     call_since: u64,
     hangup_at: u64,
     last_poll: u64,
+    /// (final END observed, next read-only NAS query), bounded to 30 seconds.
+    post_call: Option<(u64, u64)>,
     /// NAS circuit-switched attach, for the log
     cs: u8,
     selection_sent: bool,
@@ -189,6 +193,7 @@ impl Modem {
             call_since: 0,
             hangup_at: 0,
             last_poll: 0,
+            post_call: None,
             cs: 0,
             selection_sent: false,
             outbox: Vec::new(),
@@ -489,6 +494,9 @@ impl Modem {
             return Err(KERR_IN_USE);
         }
         self.status.airplane = off;
+        if off {
+            self.post_call = None;
+        }
         // Queue the latest intent behind an in-flight mode request; its confirmation is not the new intent.
         if self.radio_request.is_none() {
             self.radio_at = 0;
@@ -707,11 +715,28 @@ impl Modem {
             self.ipa_init_at = now_ms; // every 2 s until it goes out (a refused send takes up to 2 s)
             self.ipa_init_due = !self.init_driver(p);
         }
+        let mut post_queried = false;
+        if let Some((start, next)) = self.post_call {
+            if self.status.airplane || now_ms.saturating_sub(start) >= POST_CALL_MS {
+                p.log(format_args!(
+                    "nas: post-call observation ended after {}ms rat {}",
+                    now_ms.saturating_sub(start),
+                    self.status.rat
+                ));
+                self.post_call = None;
+            } else if now_ms >= next {
+                self.post_call = Some((start, now_ms.saturating_add(1000)));
+                self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
+                post_queried = true;
+            }
+        }
         if now_ms.saturating_sub(self.last_poll) < POLL_MS {
             return;
         }
         self.last_poll = now_ms;
-        self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
+        if !post_queried && self.post_call.is_none() {
+            self.request(p, NAS, nas::GET_SERVING_SYSTEM, &[]);
+        }
         self.request(p, NAS, nas::GET_SIGNAL_INFO, &[]);
     }
 
@@ -1064,6 +1089,10 @@ impl Modem {
             self.status.pending = self.command.is_some();
             if m.result() == Some(Ok(())) {
                 self.status.radio_online = online;
+                p.log(format_args!(
+                    "dms: confirmed online {} desired airplane {}",
+                    online, self.status.airplane
+                ));
                 self.status.modem = if online {
                     modem_ipc::modem::ONLINE
                 } else {
@@ -1164,12 +1193,27 @@ impl Modem {
                             |n| Text::new(&n),
                         ),
                     };
+                    if previous.is_none_or(|old| (old.id, old.state) != (c.id, c.state)) {
+                        p.log(format_args!(
+                            "voice: call {} state {} incoming {}",
+                            c.id, c.state, c.incoming
+                        ));
+                    }
                     if c.state == call::CONVERSATION && !self.answered.contains(&c.id) {
                         self.answered.push(c.id);
                     }
                 }
                 for c in old.as_slice() {
                     let ended = next.find(c.id).is_none_or(|n| n.state == call::END);
+                    if ended
+                        && !matches!(c.state, call::NONE | call::END)
+                        && next.find(c.id).is_none()
+                    {
+                        p.log(format_args!(
+                            "voice: call {} absent from new list (ended)",
+                            c.id
+                        ));
+                    }
                     if ended
                         && c.incoming
                         && !matches!(c.state, call::NONE | call::END)
@@ -1180,6 +1224,18 @@ impl Modem {
                 }
                 self.answered
                     .retain(|id| next.find(*id).is_some_and(|c| c.state != call::END));
+                let active = |c: &Call| !matches!(c.state, call::NONE | call::END);
+                let old_active = old.as_slice().iter().any(active)
+                    || (old.len == 0 && active(&self.status.call));
+                if next.as_slice().iter().any(active) {
+                    self.post_call = None;
+                } else if old_active && !self.status.airplane {
+                    self.post_call = Some((self.now, self.now));
+                    p.log(format_args!(
+                        "nas: final call END at {}ms; observing LTE return",
+                        self.now
+                    ));
+                }
                 self.status.calls = next;
                 // Incoming/waiting gets UI priority; audio independently scans the complete list.
                 self.status.call = next
@@ -1225,6 +1281,15 @@ impl Modem {
         self.status.reg = s.reg;
         self.status.rat = s.rat;
         let registered = matches!(s.reg, modem_ipc::reg::HOME | modem_ipc::reg::ROAMING);
+        if registered
+            && s.rat == modem_ipc::rat::LTE
+            && let Some((start, _)) = self.post_call.take()
+        {
+            p.log(format_args!(
+                "nas: post-call LTE confirmed after {}ms",
+                self.now.saturating_sub(start)
+            ));
+        }
         if registered {
             // online, whether or not our Set Operating Mode was needed (C5: "invalid transition" when it already was)
             self.status.modem = modem_ipc::modem::ONLINE;
@@ -2055,6 +2120,117 @@ mod tests {
             &call_ind(&[2, 2, 9, 0, 2, 3, 0, 0, 1, 3, 0, 1, 3, 0, 0]),
         );
         assert_eq!(m.status.missed, 1);
+    }
+
+    fn nas_reads(f: &Fake) -> usize {
+        f.sent
+            .iter()
+            .filter(|packet| {
+                let (h, payload) = qrtr::decode(packet).unwrap();
+                h.src_port == 0x22
+                    && qmi::Msg::parse(payload).is_some_and(|m| m.id == nas::GET_SERVING_SYSTEM)
+            })
+            .count()
+    }
+
+    #[test]
+    fn final_end_observes_actual_lte_once_per_second_without_radio_changes() {
+        let (mut m, mut f) = (modem(), fake());
+        m.ipa_up = true;
+        m.handle(&mut f, &ns(NAS, 51));
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.tick(&mut f, 1000);
+        m.handle(&mut f, &call_ind(&[1, 1, 3, 0, 1, 3, 0, 0]));
+        m.tick(&mut f, 2000);
+        m.handle(&mut f, &call_ind(&[1, 1, 9, 0, 1, 3, 0, 0]));
+        f.sent.clear();
+        m.tick(&mut f, 2000);
+        m.tick(&mut f, 2999);
+        assert_eq!(nas_reads(&f), 1);
+        m.tick(&mut f, 3000);
+        assert_eq!(nas_reads(&f), 2);
+        let lte = qmi::Builder::new(qmi::INDICATION, 1, nas::GET_SERVING_SYSTEM)
+            .tlv(1, &[1, 1, 1, 2, 1, 8])
+            .finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 51, 0x22, &lte));
+        assert!(m.post_call.is_none());
+        m.tick(&mut f, 4000);
+        assert_eq!(nas_reads(&f), 2);
+        assert!(
+            f.sent
+                .iter()
+                .all(|packet| req(packet).2 == nas::GET_SERVING_SYSTEM)
+        );
+        assert_eq!(m.status.generation, 0);
+        assert!(
+            f.logs
+                .iter()
+                .any(|line| line.contains("LTE confirmed after 1000ms"))
+        );
+    }
+
+    #[test]
+    fn post_call_queries_are_bounded_and_end_of_one_call_does_not_arm_them() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(NAS, 51));
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.tick(&mut f, 1000);
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 1, 3, 0, 1, 3, 0, 0, 2, 7, 0, 2, 3, 0, 0]),
+        );
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 1, 9, 0, 1, 3, 0, 0, 2, 7, 0, 2, 3, 0, 0]),
+        );
+        assert!(m.post_call.is_none());
+        m.tick(&mut f, 2000);
+        m.handle(&mut f, &call_ind(&[0]));
+        assert!(m.post_call.is_some());
+        f.sent.clear();
+        for now in (2000..=32_000).step_by(1000) {
+            m.tick(&mut f, now);
+        }
+        assert_eq!(nas_reads(&f), 30);
+        assert!(m.post_call.is_none());
+        assert!(f.sent.iter().all(|packet| matches!(
+            req(packet).2,
+            nas::GET_SERVING_SYSTEM | nas::GET_SIGNAL_INFO
+        )));
+        m.handle(&mut f, &call_ind(&[1, 3, 3, 0, 1, 3, 0, 0]));
+        m.handle(&mut f, &call_ind(&[0]));
+        assert!(m.post_call.is_some());
+        m.handle(&mut f, &call_ind(&[1, 4, 2, 0, 2, 3, 0, 0]));
+        assert!(m.post_call.is_none());
+    }
+
+    #[test]
+    fn routine_poll_does_not_insert_an_off_cadence_post_call_query() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(NAS, 51));
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.tick(&mut f, 29_500);
+        m.handle(&mut f, &call_ind(&[1, 1, 3, 0, 1, 3, 0, 0]));
+        m.handle(&mut f, &call_ind(&[0]));
+        f.sent.clear();
+        m.tick(&mut f, 29_500);
+        assert_eq!(nas_reads(&f), 1);
+        m.tick(&mut f, 30_000); // the routine 30s poll is due halfway between post-call queries
+        m.tick(&mut f, 30_499);
+        assert_eq!(nas_reads(&f), 1);
+        m.tick(&mut f, 30_500);
+        assert_eq!(nas_reads(&f), 2);
+    }
+
+    #[test]
+    fn airplane_cancels_post_call_observation() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(&mut f, &call_ind(&[1, 1, 3, 0, 1, 3, 0, 0]));
+        m.handle(&mut f, &call_ind(&[0]));
+        assert!(m.post_call.is_some());
+        let _ = m.airplane(&mut f, true);
+        assert!(m.post_call.is_none());
     }
 
     #[test]

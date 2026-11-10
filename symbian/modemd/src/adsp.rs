@@ -60,10 +60,10 @@ fn adsp_load(op: u32, seg: usize, offset: u32, data: &[u8]) -> i32 {
 }
 
 /// step, error, SMP2P slave-kernel bits, open channels (bit 0 IPCRTR, bit 1 APR)
-pub fn processor_state() -> [u32; 4] {
+pub fn processor_state() -> Result<[u32; 4], i32> {
     let mut s = [0u32; 4];
-    crate::hal(ADSP_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
-    s
+    let r = crate::hal(ADSP_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
+    if r < 0 { Err(r) } else { Ok(s) }
 }
 
 /// The program headers of an ELF32 .mdt (only what the load needs).
@@ -159,7 +159,14 @@ impl Adsp {
                 }
             },
             Adsp::Booting(t0) => {
-                let s = processor_state();
+                let s = match processor_state() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        dprintln!("[modemd] adsp: state read failed ({})", e);
+                        *self = Adsp::Failed;
+                        return;
+                    }
+                };
                 if s[1] != 0 {
                     dprintln!(
                         "[modemd] adsp: boot failed (step {}, error {})",
@@ -360,7 +367,7 @@ impl CallAudio {
         if self.apr.is() == Mode::Off && self.apr.idle() {
             self.ring_loaded = false;
         }
-        let mut log = |a: core::fmt::Arguments| dprintln!("[modemd] {}", a);
+        let mut log = |a: core::fmt::Arguments| dprintln!("[modemd t={}ms] {}", time::millis(), a);
         while let Some(n) = recv(RING_APR, buf) {
             self.apr.handle(&buf[..n], &mut log);
         }

@@ -22,6 +22,7 @@ use e32::sys::ipc::TVersion;
 use e32::{dprintln, time};
 use modem_proto::apr::Mode;
 use modem_proto::modem_ipc::{self, Status, op};
+use modem_proto::recovery::{self, StopProgress};
 use modem_proto::{Modem, Platform};
 
 const GROUP_VARIANT: i32 = 1;
@@ -70,10 +71,16 @@ fn hal_io(function: i32, mut io: Io) -> (i32, Io) {
 }
 
 /// boot step, error, SMP2P slave-kernel bits, IPCRTR open
-fn state() -> [u32; 4] {
+fn state() -> Result<[u32; 4], i32> {
     let mut s = [0u32; 4];
-    hal(STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
-    s
+    let r = hal(STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
+    if r < 0 { Err(r) } else { Ok(s) }
+}
+
+fn processor_stop_state() -> Result<[u32; 4], i32> {
+    let mut s = [0u32; 4];
+    let r = hal(RPROC_STATE, s.as_mut_ptr().cast(), core::ptr::null_mut());
+    if r < 0 { Err(r) } else { Ok(s) }
 }
 
 struct Hal;
@@ -123,7 +130,7 @@ impl Platform for Hal {
     }
 
     fn log(&mut self, args: fmt::Arguments) {
-        dprintln!("[modemd] {}", args);
+        dprintln!("[modemd t={}ms] {}", time::millis(), args);
     }
 }
 
@@ -142,6 +149,8 @@ enum Phase {
         mask: u32,
         since: u64,
         issued: bool,
+        /// A watchdog failure leaves stop ownership with the kernel until a terminal acknowledgement.
+        watchdog: Option<i32>,
     },
     Failed,
 }
@@ -173,6 +182,8 @@ struct Daemon {
     healthy_since: u64,
     alert_dismissed: Option<u8>,
     waiting_alert: Option<u8>,
+    audio_seen: Option<(Mode, Mode, bool)>,
+    haptic_error: i32,
 }
 
 impl Daemon {
@@ -181,8 +192,13 @@ impl Daemon {
         s.audio = self.audio.status();
         s.revision = self.published.revision;
         match self.phase {
-            Phase::Recover { .. } => {
-                s.modem = modem_ipc::modem::RECOVERING;
+            Phase::Recover { watchdog, .. } => {
+                s.modem = if let Some(error) = watchdog {
+                    s.result = error;
+                    modem_ipc::modem::FAILED
+                } else {
+                    modem_ipc::modem::RECOVERING
+                };
                 s.reg = modem_ipc::reg::NONE;
                 s.bars = 0;
             }
@@ -223,7 +239,14 @@ impl Daemon {
         self.recovery_attempt += 1;
         self.dtmf_stop = None;
         self.healthy_since = 0;
-        let _ = hal_io(HAPTIC, Io::default());
+        let haptic = hal_io(HAPTIC, Io::default()).0;
+        if haptic < 0 {
+            dprintln!(
+                "[modemd t={}ms] recovery vibration stop failed ({})",
+                time::millis(),
+                haptic
+            );
+        }
         self.audio.apr.set(Mode::Off);
         self.alert_dismissed = None;
         self.waiting_alert = None;
@@ -232,9 +255,11 @@ impl Daemon {
             mask,
             since: time::millis() + delay,
             issued: false,
+            watchdog: None,
         };
         dprintln!(
-            "[modemd] recovery attempt {} mask {}",
+            "[modemd t={}ms] recovery attempt {} mask {}",
+            time::millis(),
             self.recovery_attempt,
             mask
         );
@@ -348,7 +373,13 @@ impl Daemon {
                 }
             }
             Phase::Wait(t0) => {
-                let s = state();
+                let s = match state() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.fail("modem boot state", e);
+                        return Ok(());
+                    }
+                };
                 if s[1] != 0 {
                     self.fail("modem boot", s[1] as i32);
                 } else if s[0] == RUNNING && s[3] != 0 {
@@ -369,12 +400,32 @@ impl Daemon {
                 mask,
                 since,
                 issued,
+                watchdog,
             } => {
                 let now = time::millis();
                 if now < since {
                     return Ok(());
                 }
                 if !issued {
+                    // A previous worker may still own shutdown, or its state may be unreadable. Neither
+                    // permits another stop request. Do not interpret a HAL read failure as an idle worker.
+                    if !matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _])) {
+                        if watchdog.is_none()
+                            && now.saturating_sub(since) >= recovery::STOP_WATCHDOG_MS
+                        {
+                            dprintln!(
+                                "[modemd t={}ms] waiting for existing processor stop; quarantined",
+                                now
+                            );
+                            self.phase = Phase::Recover {
+                                mask,
+                                since,
+                                issued,
+                                watchdog: Some(err::KERR_TIMED_OUT),
+                            };
+                        }
+                        return Ok(());
+                    }
                     let r = hal_io(
                         RPROC_STOP,
                         Io {
@@ -391,26 +442,49 @@ impl Daemon {
                         mask,
                         since: now,
                         issued: true,
+                        watchdog: None,
                     };
                 } else {
-                    let mut st = [0u32; 4];
-                    let r = hal(RPROC_STATE, st.as_mut_ptr().cast(), core::ptr::null_mut());
-                    if r < 0 || st[0] == 3 || now.saturating_sub(since) > 15_000 {
-                        self.fail(
-                            "processor stop completion",
-                            if r < 0 { r } else { st[1] as i32 },
-                        );
-                    } else if st[0] == 2 {
-                        if let Some(m) = &mut self.modem {
-                            m.reset(mask & 2 == 0);
+                    match recovery::stop_progress(processor_stop_state(), now.saturating_sub(since))
+                    {
+                        StopProgress::Pending(error) => {
+                            if watchdog.is_none() && error.is_some() {
+                                dprintln!(
+                                    "[modemd t={}ms] processor stop watchdog {:?}; quarantined, still observing",
+                                    now,
+                                    error
+                                );
+                                self.phase = Phase::Recover {
+                                    mask,
+                                    since,
+                                    issued,
+                                    watchdog: error,
+                                };
+                            }
                         }
-                        self.audio = adsp::CallAudio::new();
-                        self.fatal_seen = false;
-                        if mask & 2 != 0 {
-                            self.adsp = adsp::Adsp::Idle;
-                            self.phase = Phase::Adsp;
-                        } else {
-                            self.boot_modem();
+                        StopProgress::Failed(error) => {
+                            self.fail("processor stop completion", error)
+                        }
+                        StopProgress::Complete(generations) => {
+                            dprintln!(
+                                "[modemd t={}ms] processor stop acknowledged mask {} generations {}/{} after {}ms",
+                                now,
+                                mask,
+                                generations[0],
+                                generations[1],
+                                now.saturating_sub(since)
+                            );
+                            if let Some(m) = &mut self.modem {
+                                m.reset(mask & 2 == 0);
+                            }
+                            self.audio = adsp::CallAudio::new();
+                            self.fatal_seen = false;
+                            if mask & 2 != 0 {
+                                self.adsp = adsp::Adsp::Idle;
+                                self.phase = Phase::Adsp;
+                            } else {
+                                self.boot_modem();
+                            }
                         }
                     }
                 }
@@ -505,13 +579,34 @@ impl Daemon {
     }
 
     fn run(&mut self) {
-        let st = state();
+        let st = match state() {
+            Ok(s) => s,
+            Err(e) => {
+                dprintln!(
+                    "[modemd t={}ms] modem state unavailable ({})",
+                    time::millis(),
+                    e
+                );
+                self.recover(3);
+                return;
+            }
+        };
         let dsp = adsp::processor_state();
         if st[2] & FATAL != 0 {
-            self.recover(if self.audio.apr.quiescent() { 1 } else { 3 });
+            let quiescent = self.audio.apr.quiescent();
+            let mask = recovery::recovery_mask(dsp, quiescent);
+            dprintln!(
+                "[modemd t={}ms] modem fatal; ADSP {:?} APR quiescent {} -> mask {}",
+                time::millis(),
+                dsp,
+                quiescent,
+                mask
+            );
+            self.recover(mask);
             return;
         }
-        if dsp[2] & FATAL != 0 || dsp[1] != 0 {
+        if !matches!(dsp, Ok(s) if s[2] & FATAL == 0 && s[1] == 0) {
+            dprintln!("[modemd t={}ms] ADSP unavailable {:?}", time::millis(), dsp);
             self.recover(3);
             return;
         }
@@ -567,18 +662,25 @@ impl Daemon {
         let now = time::millis();
         if ringing && !talking && !modem.status.airplane && modem.status.ring.vibrate {
             if now >= self.haptic_at {
-                let _ = hal_io(
+                let r = hal_io(
                     HAPTIC,
                     Io {
                         a: 700,
                         b: 70,
                         ..Io::default()
                     },
-                );
+                )
+                .0;
+                if self.haptic_at == 0 || r != self.haptic_error {
+                    dprintln!("[modemd t={}ms] incoming vibration start -> {}", now, r);
+                    self.haptic_error = r;
+                }
                 self.haptic_at = now + 1500;
             }
         } else if self.haptic_at != 0 {
-            let _ = hal_io(HAPTIC, Io::default());
+            let r = hal_io(HAPTIC, Io::default()).0;
+            dprintln!("[modemd t={}ms] incoming vibration stop -> {}", now, r);
+            self.haptic_error = r;
             self.haptic_at = 0;
         }
         let waiting = modem
@@ -632,20 +734,30 @@ impl Daemon {
         } else {
             ring_wanted
         };
-        self.audio.apr.set(
-            match (
-                matches!(self.adsp, adsp::Adsp::Up),
-                talking,
-                self.audio.test,
-                ring_ready,
-            ) {
-                (false, _, _, _) => Mode::Off,
-                (true, true, _, _) => Mode::Call,
-                (true, false, _, true) => Mode::Ring,
-                (true, false, Some(_), false) => Mode::Test,
-                (true, false, None, false) => Mode::Off,
-            },
-        );
+        let wanted = match (
+            matches!(self.adsp, adsp::Adsp::Up),
+            talking,
+            self.audio.test,
+            ring_ready,
+        ) {
+            (false, _, _, _) => Mode::Off,
+            (true, true, _, _) => Mode::Call,
+            (true, false, _, true) => Mode::Ring,
+            (true, false, Some(_), false) => Mode::Test,
+            (true, false, None, false) => Mode::Off,
+        };
+        let audio = (wanted, self.audio.apr.is(), self.audio.apr.quiescent());
+        if self.audio_seen != Some(audio) {
+            dprintln!(
+                "[modemd t={}ms] audio wanted {:?} current {:?} quiescent {}",
+                now,
+                audio.0,
+                audio.1,
+                audio.2
+            );
+            self.audio_seen = Some(audio);
+        }
+        self.audio.apr.set(wanted);
         if matches!(self.adsp, adsp::Adsp::Up) {
             self.audio.pump(buf);
         }
@@ -657,7 +769,7 @@ impl Daemon {
         modem.tick(&mut Hal, now);
         if now - self.last_log >= STATUS_LOG_MS {
             self.last_log = now;
-            let s = state();
+            let s = st;
             let st = modem.status;
             dprintln!(
                 "[modemd] {} s: slave-kernel {:#x}, reg {} rat {} bars {}, call state {}",
@@ -940,7 +1052,10 @@ impl Service for Daemon {
                 }
             }
             op::RETRY => {
-                if !matches!(self.phase, Phase::Failed) || self.modem.is_none() {
+                if !matches!(self.phase, Phase::Failed)
+                    || self.modem.is_none()
+                    || !matches!(processor_stop_state(), Ok([0 | 2 | 3, _, _, _]))
+                {
                     err::KERR_IN_USE
                 } else {
                     self.recovery_attempt = 0;
@@ -958,7 +1073,12 @@ impl Service for Daemon {
                     target as u8
                 }
             });
-            let _ = hal_io(HAPTIC, Io::default());
+            let haptic = hal_io(HAPTIC, Io::default()).0;
+            dprintln!(
+                "[modemd t={}ms] answered/ended vibration stop -> {}",
+                time::millis(),
+                haptic
+            );
             self.haptic_at = 0;
         }
         msg.complete(r);
@@ -1009,6 +1129,8 @@ fn main() -> i32 {
         healthy_since: 0,
         alert_dismissed: None,
         waiting_alert: None,
+        audio_seen: None,
+        haptic_error: 0,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {

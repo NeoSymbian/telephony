@@ -735,6 +735,14 @@ impl Audio {
         let p = self.packet(c);
         self.last_token = u32::from_le_bytes(p[12..16].try_into().unwrap());
         self.waiting = Some((u32::from_le_bytes([p[16], p[17], p[18], p[19]]), now));
+        if c != Cmd::AsmWrite {
+            log(format_args!(
+                "apr: send {:?} opcode {:#x} token {:#x}",
+                c,
+                self.waiting.unwrap().0,
+                self.last_token
+            ));
+        }
         Out::Send(p)
     }
 
