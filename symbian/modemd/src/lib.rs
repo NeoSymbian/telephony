@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod adsp;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -121,12 +122,53 @@ impl Platform for Hal {
     }
 
     fn fw_size(&mut self, path: &str) -> Result<usize, i32> {
-        fw_read(path, 0, &mut [])
+        match path.strip_prefix("vendor/") {
+            Some(p) => vendor_file(p, |fs, f| Ok(fs_size(fs, f))),
+            None => fw_read(path, 0, &mut []),
+        }
     }
 
     fn fw_read(&mut self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
-        fw_read(path, offset, buf)
+        match path.strip_prefix("vendor/") {
+            Some(p) => vendor_file(p, |fs, f| {
+                fs.read_at(f, offset as u64, buf).map_err(ext4_err)
+            }),
+            None => fw_read(path, offset, buf),
+        }
     }
+}
+
+fn ext4_err(e: ext4ro::Error) -> i32 {
+    match e {
+        ext4ro::Error::Io(e) => e,
+        ext4ro::Error::NotFound => -1, // KErrNotFound
+        _ => -20,                      // KErrCorrupt
+    }
+}
+
+fn fs_size(_: &mut ext4ro::Fs<Vendor>, f: &ext4ro::Inode) -> usize {
+    f.size as usize
+}
+
+/// The vendor_a file the modem is reading, kept open between its TFTP blocks (one lookup per file, not per block)
+struct OpenFile(core::cell::RefCell<Option<(String, ext4ro::Fs<Vendor>, ext4ro::Inode)>>);
+// SAFETY: only the daemon's one thread serves TFTP (Platform calls come from its loop).
+unsafe impl Sync for OpenFile {}
+static OPEN: OpenFile = OpenFile(core::cell::RefCell::new(None));
+
+fn vendor_file<T>(
+    path: &str,
+    f: impl FnOnce(&mut ext4ro::Fs<Vendor>, &ext4ro::Inode) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let mut open = OPEN.0.borrow_mut();
+    if open.as_ref().is_none_or(|o| o.0 != path) {
+        *open = None;
+        let mut fs = ext4ro::Fs::open(Vendor).map_err(ext4_err)?;
+        let file = fs.find(path).map_err(ext4_err)?;
+        *open = Some((String::from(path), fs, file));
+    }
+    let o = open.as_mut().ok_or(-1)?;
+    f(&mut o.1, &o.2)
 }
 
 /// HAL FwRead: `path` ("IMAGE/WLANMDSP.MBN") as a NUL-terminated 32-byte buffer; an empty `buf` asks for the size

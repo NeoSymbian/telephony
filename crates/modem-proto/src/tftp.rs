@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! TFTP over QRTR (service 4096), what the modem uses for its config files. Each transfer runs on a fresh local
 //! port. Writes are kept in RAM (C1: /readwrite/server_check.txt). Reads are served only from the modem's firmware
-//! partition, read-only: `/readonly/firmware/image/X` = modem_a `IMAGE/X`, the folder Linux tqftpserv maps to the
-//! remoteproc firmware. The modem's WLAN domain loads `wlanmdsp.mbn` that way, with `rsize`/`seek` reads in
+//! partitions, read-only: `/readonly/firmware/image/X` = modem_a `IMAGE/X` (the folder Linux tqftpserv maps to the
+//! remoteproc firmware) and `/readonly/vendor/firmware/X` = vendor_a `firmware/X`. The modem's WLAN domain loads `wlanmdsp.mbn` that way, with `rsize`/`seek` reads in
 //! `wsize`-block windows (Linux kprobe trace, docs wifi.md W0). Every other read is refused, as under Linux in C1.
 //! Written from linux-msm tqftpserv (`tqftpserv.c`, BSD-3) and RFC 1350/2347/2348.
 
@@ -70,9 +70,24 @@ pub enum Action {
 pub type ReadFn<'a> = dyn FnMut(&str, usize, &mut [u8]) -> Result<usize, i32> + 'a;
 
 const FW_PREFIX: &str = "/readonly/firmware/image/";
+const VENDOR_PREFIX: &str = "/readonly/vendor/firmware/";
 
-/// `/readonly/firmware/image/name.ext` -> `IMAGE/NAME.EXT` (an 8.3 name, nothing else)
+/// Where a read-only firmware file lives:
+/// - `/readonly/firmware/image/name.ext` -> modem_a `IMAGE/NAME.EXT` (FAT16, an 8.3 name);
+/// - `/readonly/vendor/firmware/name` -> vendor_a `vendor/firmware/name` (ext4; the phone keeps `wlanmdsp.mbn`
+///   there, not on modem_a: W0, 2026-11-12).
+///
+/// Nothing else: no subfolders, no `..`.
 pub fn firmware_path(name: &str) -> Option<String> {
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
+    };
+    if let Some(file) = name.strip_prefix(VENDOR_PREFIX) {
+        return (plain(file) && file.len() <= 64 && !file.starts_with('.'))
+            .then(|| alloc::format!("vendor/firmware/{file}"));
+    }
     let file = name.strip_prefix(FW_PREFIX)?;
     let (base, ext) = file.split_once('.').unwrap_or((file, ""));
     let ok = |s: &str, max: usize| {
@@ -414,6 +429,21 @@ mod tests {
         assert_eq!(&w[0][..4], &[0, 3, 0, 3]);
         assert_eq!(w[0].len(), 4 + 10000 - 8192);
         assert_eq!(reader(&r, &ack(3), &mut file), (Vec::new(), true));
+    }
+
+    #[test]
+    fn vendor_firmware_files() {
+        assert_eq!(
+            firmware_path("/readonly/vendor/firmware/wlanmdsp.mbn").as_deref(),
+            Some("vendor/firmware/wlanmdsp.mbn")
+        );
+        for bad in [
+            "/readonly/vendor/firmware/../build.prop",
+            "/readonly/vendor/firmware/a/b",
+            "/readonly/vendor/firmware/",
+        ] {
+            assert_eq!(firmware_path(bad), None, "{bad}");
+        }
     }
 
     #[test]
