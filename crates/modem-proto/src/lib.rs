@@ -14,6 +14,7 @@ pub mod nas;
 pub mod qmi;
 pub mod qrtr;
 pub mod rmtfs;
+pub mod schedule;
 pub mod ssctl;
 pub mod tftp;
 pub mod voice;
@@ -101,7 +102,11 @@ struct Client {
 pub struct Modem {
     /// Log every QRTR packet both ways (bring-up).
     pub trace: bool,
-    pub rmtfs: rmtfs::Rmtfs,
+    rmtfs: Option<rmtfs::Rmtfs>,
+    /// Startup policy: false prevents automatic online requests (not a runtime power-off command).
+    pub radio_enabled: bool,
+    /// Terminal radio failure; late packets cannot recreate clients without a reboot.
+    radio_failed: bool,
     pub servers: Vec<Server>,
     pub files: Vec<(String, Vec<u8>)>,
     pub revision: Option<String>,
@@ -158,9 +163,36 @@ pub fn mask(id: &str) -> String {
 
 impl Modem {
     pub fn new(images: [Vec<u8>; 4], rmtfs_phys: u64) -> Self {
+        Self::with_rmtfs(Some(rmtfs::Rmtfs::new(images, rmtfs_phys)))
+    }
+
+    /// ADSP support before radio partitions and carve-out are available. No RMTFS is advertised or served.
+    pub fn support_only() -> Self {
+        Self::with_rmtfs(None)
+    }
+
+    /// Attach real radio storage without resetting ADSP discovery, transactions or queued replies.
+    pub fn attach_radio(&mut self, images: [Vec<u8>; 4], phys: u64) -> Result<(), i32> {
+        if self.rmtfs.is_some() {
+            return Err(KERR_IN_USE);
+        }
+        if phys == 0
+            || phys % 512 != 0
+            || phys.checked_add(0x20_0000).is_none()
+            || images.iter().any(Vec::is_empty)
+        {
+            return Err(KERR_ARGUMENT);
+        }
+        self.rmtfs = Some(rmtfs::Rmtfs::new(images, phys));
+        Ok(())
+    }
+
+    fn with_rmtfs(rmtfs: Option<rmtfs::Rmtfs>) -> Self {
         Modem {
             trace: false,
-            rmtfs: rmtfs::Rmtfs::new(images, rmtfs_phys),
+            rmtfs,
+            radio_enabled: true,
+            radio_failed: false,
             servers: Vec::new(),
             files: Vec::new(),
             revision: None,
@@ -261,7 +293,10 @@ impl Modem {
     /// Our servers: IPA's only while the kernel runs IPA.
     fn services(&self) -> impl Iterator<Item = (u32, u32, u32, u32)> {
         let ipa_up = self.ipa_up;
-        SERVICES.into_iter().filter(move |s| ipa_up || s.0 != IPA)
+        let radio = self.rmtfs.is_some();
+        SERVICES
+            .into_iter()
+            .filter(move |s| (radio || s.0 != rmtfs::SERVICE) && (ipa_up && radio || s.0 != IPA))
     }
 
     fn announce(&mut self, p: &mut dyn Platform, dst: (u32, u32)) {
@@ -278,6 +313,9 @@ impl Modem {
 
     /// Say HELLO to the modem's router and announce our services.
     pub fn start(&mut self, p: &mut dyn Platform) {
+        if self.rmtfs.is_none() || !self.radio_enabled || self.radio_failed {
+            return;
+        }
         self.status.modem = modem_ipc::modem::RUNNING;
         self.ctrl(p, qrtr::TYPE_HELLO, (MODEM_NODE, PORT_CTRL), [0; 4]);
         self.announce(p, (MODEM_NODE, PORT_CTRL));
@@ -336,6 +374,11 @@ impl Modem {
 
     /// The first requests once the modem announces a service we are a client of.
     fn client_up(&mut self, p: &mut dyn Platform, s: Server) {
+        if s.node == MODEM_NODE
+            && (self.rmtfs.is_none() || !self.radio_enabled || self.radio_failed)
+        {
+            return;
+        }
         let Some(&(_, port)) = CLIENTS.iter().find(|c| c.0 == s.service) else {
             return;
         };
@@ -352,8 +395,8 @@ impl Modem {
         }
         match s.service {
             DMS => {
-                self.request(p, DMS, DMS_GET_REVISION, &[]);
-                self.request(p, DMS, DMS_GET_IDS, &[]);
+                self.request_must(p, DMS, DMS_GET_REVISION, &[]);
+                self.request_must(p, DMS, DMS_GET_IDS, &[]);
                 self.maybe_online(p);
             }
             UIM => {
@@ -432,15 +475,18 @@ impl Modem {
         let ind = qmi::Builder::new(qmi::INDICATION, 1, ipa::INIT_COMPLETE)
             .result(0)
             .finish();
-        self.send(p, qrtr::TYPE_DATA, IPA_PORT, dst, &ind);
+        self.send_must(p, qrtr::TYPE_DATA, IPA_PORT, dst, &ind);
         p.log(format_args!("ipa: handshake complete"));
     }
 
     /// The radio on (DMS Set Operating Mode online) once there is a SIM: ModemManager does the same on enable.
     fn maybe_online(&mut self, p: &mut dyn Platform) {
-        if !self.online_sent
+        if self.radio_enabled
+            && !self.radio_failed
+            && self.rmtfs.is_some()
+            && !self.online_sent
             && self.status.sim == modem_ipc::sim::PRESENT
-            && self.request(p, DMS, DMS_SET_OPERATING_MODE, &[(0x01, &[0])])
+            && self.request_must(p, DMS, DMS_SET_OPERATING_MODE, &[(0x01, &[0])])
         {
             self.online_sent = true;
         }
@@ -496,12 +542,17 @@ impl Modem {
     /// The modem died (SMP2P fatal): nothing it reported holds any more. The UI shows "No service".
     /// shortcut: no restart (SSR) yet; a reboot brings the modem back.
     pub fn lost(&mut self) {
+        self.radio_failed = true;
         self.status = Status {
             modem: modem_ipc::modem::FAILED,
             sim: self.status.sim,
             ..Status::default()
         };
         self.clients.clear();
+        // A permanently unavailable radio must not block queued replies to the still-running ADSP.
+        self.outbox.retain(|(_, _, dst, _)| dst.0 != MODEM_NODE);
+        self.servers.retain(|s| s.node != MODEM_NODE);
+        self.ssctl[0] = None;
     }
 
     /// Place a call (modem_ipc::op::DIAL). KErrArgument for a number [`voice::dialable`] refuses, KErrInUse while a
@@ -582,6 +633,11 @@ impl Modem {
         }
         if h.dst_node != NODE && h.dst_node != NODE_BCAST {
             return;
+        }
+        if h.src_node == MODEM_NODE
+            && (self.radio_failed || !self.radio_enabled || self.rmtfs.is_none())
+        {
+            return; // no SSR yet: late packets must not resurrect a terminally failed radio
         }
         let from = (h.src_node, h.src_port);
         // flow control: a sender marks a packet confirm_rx and waits for RESUME_TX before it sends that port more.
@@ -673,7 +729,7 @@ impl Modem {
                     }
                 ));
                 if let Some(resp) = resp {
-                    self.send(p, qrtr::TYPE_DATA, IPA_PORT, from, &resp);
+                    self.send_must(p, qrtr::TYPE_DATA, IPA_PORT, from, &resp);
                 }
                 self.ipa_complete(p);
             }
@@ -682,7 +738,10 @@ impl Modem {
                     return;
                 };
                 let resp = if h.dst_port == RMTFS_PORT {
-                    self.rmtfs.handle(p, &m)
+                    let Some(rmtfs) = &mut self.rmtfs else {
+                        return;
+                    };
+                    rmtfs.handle(p, &m)
                 } else {
                     locator::handle(&m)
                 };
@@ -693,7 +752,7 @@ impl Modem {
                         core::str::from_utf8(name).unwrap_or("?")
                     ));
                 }
-                self.send(p, qrtr::TYPE_DATA, h.dst_port, from, &resp);
+                self.send_must(p, qrtr::TYPE_DATA, h.dst_port, from, &resp);
             }
             SSCTL_PORT => {
                 let Some(m) = qmi::Msg::parse(payload).filter(|m| m.ty == qmi::RESPONSE) else {
@@ -712,14 +771,14 @@ impl Modem {
             TFTP_PORT => match tftp::request(payload, from, self.next_port) {
                 tftp::Action::Reply(r) => {
                     p.log(format_args!("tftp: refused {:?}", tftp_name(payload)));
-                    self.send(p, qrtr::TYPE_DATA, TFTP_PORT, from, &r);
+                    self.send_must(p, qrtr::TYPE_DATA, TFTP_PORT, from, &r);
                 }
                 tftp::Action::Start(t, first) => {
                     p.log(format_args!("tftp: write {:?}", t.name));
                     self.next_port += 1;
                     let port = t.port;
                     self.transfers.push(t);
-                    self.send(p, qrtr::TYPE_DATA, port, from, &first);
+                    self.send_must(p, qrtr::TYPE_DATA, port, from, &first);
                 }
                 tftp::Action::Ignore => {}
             },
@@ -730,7 +789,7 @@ impl Modem {
                 };
                 let (reply, done) = tftp::transfer(&mut self.transfers[i], payload);
                 if let Some(r) = reply {
-                    self.send(p, qrtr::TYPE_DATA, port, from, &r);
+                    self.send_must(p, qrtr::TYPE_DATA, port, from, &r);
                 }
                 if done {
                     let t = self.transfers.remove(i);
@@ -1050,6 +1109,183 @@ mod tests {
     }
 
     #[test]
+    fn support_router_serves_adsp_without_advertising_radio_storage() {
+        let (mut m, mut f) = (Modem::support_only(), fake());
+        m.ipa_up = true; // even a prematurely set IPA flag must not expose unprepared radio resources
+        assert!(m.services().all(|s| s.0 != rmtfs::SERVICE && s.0 != IPA));
+        m.start(&mut f);
+        assert!(f.sent.is_empty());
+        let hello = Header {
+            ty: qrtr::TYPE_HELLO,
+            src_node: 5,
+            src_port: PORT_CTRL,
+            dst_node: NODE,
+            dst_port: PORT_CTRL,
+            ..Default::default()
+        };
+        m.handle(
+            &mut f,
+            &qrtr::encode(&hello, &qrtr::ctrl(qrtr::TYPE_HELLO, [0; 4])),
+        );
+        assert_eq!(f.sent.len(), 3); // HELLO, locator, TFTP
+        assert!(f.nodes.iter().all(|&node| node == 5));
+        let q = qmi::Builder::new(qmi::REQUEST, 3, 0x20)
+            .tlv(1, b"avs/audio")
+            .finish();
+        let h = Header {
+            ty: qrtr::TYPE_DATA,
+            dst_port: LOCATOR_PORT,
+            ..hello
+        };
+        m.handle(&mut f, &qrtr::encode(&h, &q));
+        assert_eq!(reply(&f).result(), Some(Ok(())));
+        let before = f.sent.len();
+        let alloc = qmi::Builder::new(qmi::REQUEST, 4, 4).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 17, RMTFS_PORT, &alloc));
+        assert_eq!(f.sent.len(), before); // no reply containing an invented address
+    }
+
+    #[test]
+    fn attaching_storage_preserves_adsp_discovery_and_retry_queue() {
+        let (mut m, mut f) = (Modem::support_only(), fake());
+        f.refuse = 1;
+        let h = Header {
+            ty: qrtr::TYPE_HELLO,
+            src_node: 5,
+            src_port: PORT_CTRL,
+            dst_node: NODE,
+            dst_port: PORT_CTRL,
+            ..Default::default()
+        };
+        let hello = qrtr::encode(&h, &qrtr::ctrl(qrtr::TYPE_HELLO, [0; 4]));
+        m.handle(&mut f, &hello);
+        let queued = m.outbox.clone();
+        assert_eq!(queued.len(), 3);
+        assert_eq!(m.attach_radio(Default::default(), 0), Err(KERR_ARGUMENT));
+        assert!(m.rmtfs.is_none());
+        let storage = || core::array::from_fn(|_| alloc::vec![1; 512]);
+        assert_eq!(m.attach_radio(storage(), 0xfc20_1000), Ok(()));
+        assert_eq!(m.outbox, queued);
+        assert_eq!(m.hello_seen, [5]);
+        assert_eq!(m.attach_radio(storage(), 0xfc20_1000), Err(KERR_IN_USE));
+        m.handle(&mut f, &hello); // existing ADSP HELLO stays suppressed after attachment
+        assert_eq!(m.outbox, queued);
+        m.tick(&mut f, 1000);
+        assert!(m.outbox.is_empty());
+        assert!(f.nodes.iter().all(|&node| node == 5));
+        assert!(m.services().any(|s| s.0 == rmtfs::SERVICE));
+    }
+
+    #[test]
+    fn failed_radio_cannot_block_queued_adsp_replies() {
+        let (mut m, mut f) = (modem(), fake());
+        f.refuse = 2;
+        m.ctrl(&mut f, qrtr::TYPE_HELLO, (MODEM_NODE, PORT_CTRL), [0; 4]);
+        m.ctrl(&mut f, qrtr::TYPE_HELLO, (5, PORT_CTRL), [0; 4]);
+        m.lost();
+        assert_eq!(m.outbox.len(), 1);
+        assert_eq!(m.outbox[0].2.0, 5);
+        m.tick(&mut f, 1000); // second refusal remains queued
+        assert_eq!(m.outbox.len(), 1);
+        m.tick(&mut f, 2000);
+        assert!(m.outbox.is_empty());
+        assert_eq!(f.nodes, [5]);
+    }
+
+    #[test]
+    fn late_radio_packets_after_failure_cannot_recreate_head_of_line_blocking() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(DMS, 68));
+        m.lost();
+        f.sent.clear();
+        f.nodes.clear();
+        f.refuse = 1;
+        let mut late = ns(DMS, 68);
+        late[16] = 1; // even its flow-control response must not requeue dead-radio traffic
+        m.handle(&mut f, &late);
+        assert!(m.clients.is_empty());
+        assert!(m.outbox.is_empty());
+        let h = Header {
+            ty: qrtr::TYPE_HELLO,
+            src_node: 5,
+            src_port: PORT_CTRL,
+            dst_node: NODE,
+            dst_port: PORT_CTRL,
+            ..Default::default()
+        };
+        m.handle(
+            &mut f,
+            &qrtr::encode(&h, &qrtr::ctrl(qrtr::TYPE_HELLO, [0; 4])),
+        );
+        assert_eq!(m.outbox.len(), 4); // HELLO and the still-attached support services
+        m.tick(&mut f, 1000);
+        assert!(m.outbox.is_empty());
+        assert_eq!(f.nodes, [5, 5, 5, 5]);
+        assert_eq!(m.status.modem, modem_ipc::modem::FAILED);
+    }
+
+    #[test]
+    fn refused_online_transition_retries_the_same_transaction_once() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(DMS, 68));
+        f.sent.clear();
+        f.nodes.clear();
+        m.status.sim = modem_ipc::sim::PRESENT;
+        f.refuse = 1;
+        m.maybe_online(&mut f);
+        assert!(m.online_sent); // accepted for ordered delivery, not yet reported online
+        assert!(f.sent.is_empty());
+        let queued = m.outbox[0].3.clone();
+        m.maybe_online(&mut f); // no duplicate transaction while queued
+        assert_eq!(m.outbox.len(), 1);
+        m.tick(&mut f, 500);
+        assert!(f.sent.is_empty());
+        m.tick(&mut f, 1000);
+        m.tick(&mut f, 2000);
+        assert_eq!(f.sent.len(), 1);
+        let (_, actual) = qrtr::decode(&f.sent[0]).unwrap();
+        assert_eq!(actual, queued);
+        assert_eq!(qmi::Msg::parse(actual).unwrap().id, DMS_SET_OPERATING_MODE);
+        assert_ne!(m.status.modem, modem_ipc::modem::ONLINE);
+    }
+
+    #[test]
+    fn refused_storage_and_locator_replies_keep_their_transactions() {
+        for (port, id) in [(RMTFS_PORT, 4), (LOCATOR_PORT, 0x20)] {
+            let (mut m, mut f) = (modem(), fake());
+            let request = qmi::Builder::new(qmi::REQUEST, 7, id)
+                .tlv(1, b"avs/audio")
+                .finish();
+            f.refuse = 1;
+            m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 17, port, &request));
+            assert!(f.sent.is_empty());
+            assert_eq!(m.outbox.len(), 1);
+            let queued = m.outbox[0].3.clone();
+            m.tick(&mut f, 1000);
+            m.tick(&mut f, 2000);
+            assert_eq!(f.sent.len(), 1);
+            let (header, actual) = qrtr::decode(&f.sent[0]).unwrap();
+            assert_eq!((header.src_port, header.dst_port), (port, 17));
+            assert_eq!(actual, queued);
+            let reply = qmi::Msg::parse(actual).unwrap();
+            assert_eq!((reply.ty, reply.txn, reply.id), (qmi::RESPONSE, 7, id));
+            assert_eq!(reply.result(), Some(Ok(())));
+        }
+    }
+
+    #[test]
+    fn disabled_radio_does_not_send_boot_announcements_or_online_requests() {
+        let (mut m, mut f) = (modem(), fake());
+        m.radio_enabled = false;
+        m.status.sim = modem_ipc::sim::PRESENT;
+        m.start(&mut f);
+        m.maybe_online(&mut f);
+        m.tick(&mut f, 30000);
+        assert!(f.sent.is_empty());
+        assert!(!m.online_sent);
+    }
+
+    #[test]
     fn start_says_hello_and_announces_three_services() {
         let (mut m, mut f) = (modem(), fake());
         m.start(&mut f);
@@ -1182,7 +1418,7 @@ mod tests {
         m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 18, RMTFS_PORT, &read));
         assert_eq!(reply(&f).result(), Some(Ok(())));
         assert!(f.mem[0x200..0x400].iter().all(|&b| b == 1));
-        assert_eq!(m.rmtfs.reads, 1);
+        assert_eq!(m.rmtfs.as_ref().unwrap().reads, 1);
     }
 
     #[test]
@@ -1210,8 +1446,12 @@ mod tests {
             .u8(4, 0)
             .finish();
         m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 20, RMTFS_PORT, &w));
-        assert!(m.rmtfs.images[1][3 * 512..4 * 512].iter().all(|&b| b == 9));
-        assert_eq!(m.rmtfs.writes, 1);
+        assert!(
+            m.rmtfs.as_ref().unwrap().images[1][3 * 512..4 * 512]
+                .iter()
+                .all(|&b| b == 9)
+        );
+        assert_eq!(m.rmtfs.as_ref().unwrap().writes, 1);
     }
 
     #[test]

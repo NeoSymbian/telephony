@@ -11,6 +11,10 @@ publish = false
 crate-type = ["staticlib"]
 test = false
 
+[features]
+# Startup-only diagnostic build: never boot MSS or request radio online; ADSP/loopback remain available.
+radio-disabled = []
+
 [dependencies]
 e32.workspace = true
 modem-proto.workspace = true
