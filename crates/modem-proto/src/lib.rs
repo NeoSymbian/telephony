@@ -18,6 +18,7 @@ pub mod schedule;
 pub mod ssctl;
 pub mod tftp;
 pub mod voice;
+pub mod wlfw;
 
 pub use modem_ipc;
 
