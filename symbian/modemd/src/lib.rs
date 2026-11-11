@@ -35,6 +35,8 @@ const RMTFS_MEM: i32 = 0x4e12;
 const IPA_START: i32 = 0x4e13;
 /// a file of modem_a's FAT16 (kernel qcom_telhal.cpp FwRead): TFTP's /readonly/firmware/image/ (Wi-Fi W0)
 const FW_READ: i32 = 0x4e1b;
+/// the Wi-Fi firmware's MSA regions to its VMIDs (kernel qcom_telhal.cpp WlanMsa, Wi-Fi W1)
+const WLAN_MSA: i32 = 0x4e1c;
 /// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
 const VENDOR: u32 = 4;
 const SECTOR: u64 = 512;
@@ -135,6 +137,49 @@ impl Platform for Hal {
             }),
             None => fw_read(path, offset, buf),
         }
+    }
+
+    fn wlan_msa(&mut self, regions: &[modem_proto::wlfw::Region]) -> Result<(), i32> {
+        for r in regions {
+            let io = Io {
+                a: 1,
+                b: r.addr as u32,
+                len: r.size,
+                buf: r.secure as u32,
+            };
+            let e = hal_io(WLAN_MSA, io).0;
+            if e < 0 {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// The board data on vendor_a: Pixel 3a XL's `firmware/bdwlan-bonito.bin` (the factory image also has -ROW,
+    /// -USA, -JPN, -VZW regional variants and the 3a's -sargo set), else the generic names.
+    /// shortcut: the board name and the default (non-regional) file are fixed; pick by device and region before release.
+    fn board_data(&mut self, board_id: u32) -> Vec<u8> {
+        let names = [
+            String::from("firmware/bdwlan-bonito.bin"),
+            alloc::format!("firmware/bdwlan.b{:02x}", board_id & 0xff),
+            String::from("firmware/bdwlan.bin"),
+        ];
+        for n in &names {
+            let got = vendor_file(n, |fs, f| {
+                if f.size > 0x10_0000 {
+                    return Err(-9); // KErrOverflow: a board file is tens of KB
+                }
+                fs.read(f).map_err(ext4_err)
+            });
+            match got {
+                Ok(d) => {
+                    dprintln!("[modemd] wlfw: board data from {n}");
+                    return d;
+                }
+                Err(e) => dprintln!("[modemd] wlfw: no {n} ({e})"),
+            }
+        }
+        Vec::new()
     }
 }
 

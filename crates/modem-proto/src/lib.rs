@@ -44,6 +44,14 @@ pub trait Platform {
     fn fw_read(&mut self, _path: &str, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32> {
         Err(-5)
     }
+    /// Hand the Wi-Fi firmware's MSA regions to its VMIDs (TrustZone; kernel HAL WlanMsa). Wi-Fi W1.
+    fn wlan_msa(&mut self, _regions: &[wlfw::Region]) -> Result<(), i32> {
+        Err(-5)
+    }
+    /// The WCN3990 board data file for `board_id` (vendor_a), or empty if there is none.
+    fn board_data(&mut self, _board_id: u32) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 pub const NODE: u32 = 1;
@@ -54,6 +62,10 @@ const TFTP_PORT: u32 = 0x12;
 const IPA_PORT: u32 = 0x13;
 /// our SSCTL client port (the "subsystem up" events, ssctl.rs)
 const SSCTL_PORT: u32 = 0x25;
+/// our WLFW client port (the Wi-Fi firmware's control service, wlfw.rs)
+const WLFW_PORT: u32 = 0x26;
+/// DTB wlan-msa@94d00000: the MSA carve-out the Wi-Fi firmware may use
+const WLAN_MSA: (u64, u32) = (0x94d0_0000, 0x10_0000);
 const FIRST_TRANSFER_PORT: u32 = 0x100;
 /// (service, version, instance, our port); the IPA server is announced only once the kernel runs IPA
 const SERVICES: [(u32, u32, u32, u32); 4] = [
@@ -135,6 +147,9 @@ pub struct Modem {
     transfers: Vec<tftp::Transfer>,
     /// firmware reads in progress (the modem's WLAN domain image)
     readers: Vec<tftp::Reader>,
+    /// the Wi-Fi firmware's control service once it appears: its address and our client (W1)
+    wlfw: Option<((u32, u32), wlfw::Client)>,
+    wlfw_board: u32,
     next_port: u32,
     clients: Vec<Client>,
     /// the nodes whose HELLO we answered (the modem, the ADSP)
@@ -212,6 +227,8 @@ impl Modem {
             status: Status::default(),
             transfers: Vec::new(),
             readers: Vec::new(),
+            wlfw: None,
+            wlfw_board: 0xff,
             next_port: FIRST_TRANSFER_PORT,
             clients: Vec::new(),
             hello_seen: Vec::new(),
@@ -695,6 +712,15 @@ impl Modem {
                     instance >> 8
                 ));
                 self.client_up(p, s);
+                if service == wlfw::SERVICE && node == MODEM_NODE {
+                    let mut c = wlfw::Client::new(WLAN_MSA.0, WLAN_MSA.1);
+                    let steps = c.start();
+                    self.wlfw = Some(((node, port), c));
+                    p.log(format_args!(
+                        "wlfw: the Wi-Fi firmware's service is up; starting"
+                    ));
+                    self.wlfw_steps(p, steps);
+                }
             }
             qrtr::TYPE_NEW_LOOKUP => {
                 // the remote looks up our services: matching NEW_SERVERs, then an empty one ends the list
@@ -828,6 +854,13 @@ impl Modem {
                 },
                 tftp::Action::Ignore => {}
             },
+            WLFW_PORT => {
+                let steps = match &mut self.wlfw {
+                    Some((dst, c)) if *dst == from => c.message(payload),
+                    _ => return,
+                };
+                self.wlfw_steps(p, steps);
+            }
             port if self
                 .readers
                 .iter()
@@ -875,6 +908,64 @@ impl Modem {
                     self.files.push((t.name, t.data));
                 }
             }
+        }
+    }
+
+    /// Carry out what the WLFW client asks for (wlfw.rs): sends, the MSA assignment, the board data
+    fn wlfw_steps(&mut self, p: &mut dyn Platform, mut steps: Vec<wlfw::Step>) {
+        while !steps.is_empty() {
+            let mut next = Vec::new();
+            for s in steps {
+                let Some((dst, _)) = &self.wlfw else {
+                    return;
+                };
+                let dst = *dst;
+                match s {
+                    wlfw::Step::Send(m) => {
+                        let id = qmi::Msg::parse(&m).map_or(0, |q| q.id);
+                        p.log(format_args!("wlfw: request {id:#x}"));
+                        self.send_must(p, qrtr::TYPE_DATA, WLFW_PORT, dst, &m);
+                    }
+                    wlfw::Step::AssignMsa(regions) => {
+                        for r in &regions {
+                            p.log(format_args!(
+                                "wlfw: MSA region {:#x} + {:#x}{}",
+                                r.addr,
+                                r.size,
+                                if r.secure { " (secure)" } else { "" }
+                            ));
+                        }
+                        let r = p.wlan_msa(&regions);
+                        p.log(format_args!("wlfw: MSA assigned -> {r:?}"));
+                        if let Some((_, c)) = &mut self.wlfw {
+                            next.extend(c.msa_assigned(r.is_ok()));
+                        }
+                    }
+                    wlfw::Step::LoadBoardData => {
+                        let data = p.board_data(self.wlfw_board);
+                        p.log(format_args!("wlfw: board data {} bytes", data.len()));
+                        if let Some((_, c)) = &mut self.wlfw {
+                            next.extend(c.board_data(data));
+                        }
+                    }
+                    wlfw::Step::Caps(k) => {
+                        self.wlfw_board = k.board_id;
+                        p.log(format_args!(
+                            "wlfw: chip {:#x} family {:#x} board {:#x} soc {:#x} fw {:#x} {} {}",
+                            k.chip_id,
+                            k.chip_family,
+                            k.board_id,
+                            k.soc_id,
+                            k.fw_version,
+                            k.fw_timestamp,
+                            k.fw_build_id
+                        ));
+                    }
+                    wlfw::Step::Ready => p.log(format_args!("wlfw: firmware ready (W1 done)")),
+                    wlfw::Step::Failed(what, e) => p.log(format_args!("wlfw: {what} failed ({e})")),
+                }
+            }
+            steps = next;
         }
     }
 
