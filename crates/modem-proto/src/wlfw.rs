@@ -166,6 +166,148 @@ pub fn wlan_cfg(
         .finish()
 }
 
+/// WCN3990's copy engines as the firmware must configure them (ath10k snoc.c `target_ce_config_wlan`): pipe, dir
+/// (1 in = target to host, 2 out, 3 both), entries, max bytes, flags (8 = no interrupt)
+pub const WCN3990_PIPES: [CePipe; 12] = [
+    CePipe {
+        num: 0,
+        dir: 2,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 1,
+        dir: 1,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 2,
+        dir: 1,
+        entries: 64,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 3,
+        dir: 2,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 4,
+        dir: 2,
+        entries: 256,
+        max_bytes: 256,
+        flags: 8,
+    },
+    CePipe {
+        num: 5,
+        dir: 2,
+        entries: 1024,
+        max_bytes: 64,
+        flags: 8,
+    },
+    CePipe {
+        num: 6,
+        dir: 3,
+        entries: 32,
+        max_bytes: 16384,
+        flags: 0,
+    },
+    CePipe {
+        num: 7,
+        dir: 4,
+        entries: 0,
+        max_bytes: 0,
+        flags: 8,
+    },
+    CePipe {
+        num: 8,
+        dir: 1,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 9,
+        dir: 1,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 10,
+        dir: 1,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+    CePipe {
+        num: 11,
+        dir: 1,
+        entries: 32,
+        max_bytes: 2048,
+        flags: 0,
+    },
+];
+
+/// HTC service ids (ath10k htc.h: group << 8 | index)
+pub const SVC_RSVD_CTRL: u32 = 0x0001;
+pub const SVC_WMI_CONTROL: u32 = 0x0100;
+pub const SVC_HTT_DATA: u32 = 0x0300;
+
+/// HTC service -> pipe {service, dir, pipe} (ath10k snoc.c `target_service_to_ce_map_wlan`, its terminator included:
+/// ath10k sends the whole array)
+pub const WCN3990_SERVICES: [[u32; 3]; 21] = [
+    [0x0104, 2, 3],
+    [0x0104, 1, 2],
+    [0x0102, 2, 3],
+    [0x0102, 1, 2],
+    [0x0101, 2, 3],
+    [0x0101, 1, 2],
+    [0x0103, 2, 3],
+    [0x0103, 1, 2],
+    [SVC_WMI_CONTROL, 2, 3],
+    [SVC_WMI_CONTROL, 1, 2],
+    [SVC_RSVD_CTRL, 2, 0],
+    [SVC_RSVD_CTRL, 1, 2],
+    [0xfe00, 2, 0],
+    [0xfe00, 1, 2],
+    [SVC_HTT_DATA, 2, 4],
+    [SVC_HTT_DATA, 1, 1],
+    [0xfe00, 2, 5],
+    [0x0301, 1, 9],
+    [0x0302, 1, 10],
+    [0x0600, 1, 11],
+    [0, 0, 0],
+];
+
+/// Shadow registers {ce, offset}: source write index 0x3c for host-to-target CEs, destination 0x40 for the others
+/// (ath10k snoc.c `target_shadow_reg_cfg_map`)
+pub const WCN3990_SHADOW: [(u16, u16); 12] = [
+    (0, 0x3c),
+    (3, 0x3c),
+    (4, 0x3c),
+    (5, 0x3c),
+    (7, 0x3c),
+    (1, 0x40),
+    (2, 0x40),
+    (7, 0x40),
+    (8, 0x40),
+    (9, 0x40),
+    (10, 0x40),
+    (11, 0x40),
+];
+
+/// WLAN cfg for WCN3990 (the step ath10k_snoc_wlan_enable sends before mission mode)
+pub fn wcn3990_cfg(txn: u16) -> Vec<u8> {
+    wlan_cfg(txn, &WCN3990_PIPES, &WCN3990_SERVICES, &WCN3990_SHADOW)
+}
+
 fn le32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
@@ -485,6 +627,27 @@ mod tests {
         assert_eq!(p.tlv(0x13), Some(&[3u8, 0, 1, 2, 3][..]));
         assert_eq!(p.u8(0x14), Some(1));
         assert_eq!(p.u32(0x11), Some(10));
+    }
+
+    #[test]
+    fn wcn3990_cfg_sizes_fit_the_message() {
+        let m = wcn3990_cfg(9);
+        let p = Msg::parse(&m).unwrap();
+        let t = p.tlv(0x11).unwrap();
+        assert_eq!((t[0], t.len()), (12, 1 + 12 * 20));
+        assert_eq!(
+            &t[1 + 6 * 20..1 + 6 * 20 + 12],
+            &[6, 0, 0, 0, 3, 0, 0, 0, 32, 0, 0, 0]
+        );
+        let s = p.tlv(0x12).unwrap();
+        assert_eq!((s[0], s.len()), (21, 1 + 21 * 12));
+        let r = p.tlv(0x13).unwrap();
+        assert_eq!((r[0], r.len()), (12, 1 + 12 * 4));
+        assert_eq!(&r[1..5], &[0, 0, 0x3c, 0]);
+        // limits of the message (QMI_WLFW_MAX_NUM_CE / _SVC / _SHADOW_REG)
+        assert!(
+            WCN3990_PIPES.len() <= 12 && WCN3990_SERVICES.len() <= 24 && WCN3990_SHADOW.len() <= 24
+        );
     }
 
     #[test]
