@@ -32,6 +32,8 @@ const RECV: i32 = 0x4e10;
 const PART_READ: i32 = 0x4e11;
 const RMTFS_MEM: i32 = 0x4e12;
 const IPA_START: i32 = 0x4e13;
+/// a file of modem_a's FAT16 (kernel qcom_telhal.cpp FwRead): TFTP's /readonly/firmware/image/ (Wi-Fi W0)
+const FW_READ: i32 = 0x4e1b;
 /// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
 const VENDOR: u32 = 4;
 const SECTOR: u64 = 512;
@@ -116,6 +118,33 @@ impl Platform for Hal {
 
     fn log(&mut self, args: fmt::Arguments) {
         dprintln!("[modemd] {}", args);
+    }
+
+    fn fw_size(&mut self, path: &str) -> Result<usize, i32> {
+        fw_read(path, 0, &mut [])
+    }
+
+    fn fw_read(&mut self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
+        fw_read(path, offset, buf)
+    }
+}
+
+/// HAL FwRead: `path` ("IMAGE/WLANMDSP.MBN") as a NUL-terminated 32-byte buffer; an empty `buf` asks for the size
+fn fw_read(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    let mut name = [0u8; 32];
+    if path.len() >= name.len() {
+        return Err(-6); // KErrArgument
+    }
+    name[..path.len()].copy_from_slice(path.as_bytes());
+    let mut io = Io {
+        a: 0,
+        b: offset as u32,
+        len: buf.len() as u32,
+        buf: buf.as_mut_ptr() as u32,
+    };
+    match hal(FW_READ, (&mut io as *mut Io).cast(), name.as_mut_ptr()) {
+        r if r < 0 => Err(r),
+        r => Ok(r as usize),
     }
 }
 
@@ -601,6 +630,7 @@ fn main() -> i32 {
         modem: Some({
             let mut router = Modem::support_only();
             router.radio_enabled = !cfg!(feature = "radio-disabled");
+            router.trace = cfg!(feature = "qrtr-trace"); // every QRTR packet in the log (Wi-Fi W0)
             router
         }),
         rx: vec![0u8; 0x2000],

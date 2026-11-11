@@ -35,6 +35,14 @@ pub trait Platform {
     fn rmtfs_read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), i32>;
     fn rmtfs_write(&mut self, offset: u32, data: &[u8]) -> Result<(), i32>;
     fn log(&mut self, args: fmt::Arguments);
+    /// The size of a read-only file on the modem's firmware partition (modem_a, "IMAGE/WLANMDSP.MBN"), for TFTP.
+    fn fw_size(&mut self, _path: &str) -> Result<usize, i32> {
+        Err(-5) // KErrNotSupported
+    }
+    /// Its bytes at `offset` into `buf`: how many (fewer at its end).
+    fn fw_read(&mut self, _path: &str, _offset: usize, _buf: &mut [u8]) -> Result<usize, i32> {
+        Err(-5)
+    }
 }
 
 pub const NODE: u32 = 1;
@@ -124,6 +132,8 @@ pub struct Modem {
     /// What NeoModem clients see (modem_ipc::op::STATUS)
     pub status: Status,
     transfers: Vec<tftp::Transfer>,
+    /// firmware reads in progress (the modem's WLAN domain image)
+    readers: Vec<tftp::Reader>,
     next_port: u32,
     clients: Vec<Client>,
     /// the nodes whose HELLO we answered (the modem, the ADSP)
@@ -200,6 +210,7 @@ impl Modem {
             card: None,
             status: Status::default(),
             transfers: Vec::new(),
+            readers: Vec::new(),
             next_port: FIRST_TRANSFER_PORT,
             clients: Vec::new(),
             hello_seen: Vec::new(),
@@ -689,6 +700,13 @@ impl Modem {
                 let Some((_, [service, instance, _, _])) = qrtr::ctrl_words(payload) else {
                     return;
                 };
+                // what the remote expects to find here (Wi-Fi W0: services the modem waits for)
+                p.log(format_args!(
+                    "qrtr: lookup {service} i{} from {}:{}",
+                    instance >> 8,
+                    h.src_node,
+                    h.src_port
+                ));
                 let services: Vec<_> = self.services().collect();
                 for (s, v, i, port) in services {
                     if (service == 0 || service == s)
@@ -780,11 +798,65 @@ impl Modem {
                     self.transfers.push(t);
                     self.send_must(p, qrtr::TYPE_DATA, port, from, &first);
                 }
+                tftp::Action::Read(q) => match p.fw_size(&q.path) {
+                    Ok(size) => {
+                        p.log(format_args!(
+                            "tftp: read {:?} ({size} bytes), blksize {} wsize {} rsize {} seek {:?}",
+                            tftp_name(payload),
+                            q.blksize,
+                            q.wsize,
+                            q.rsize,
+                            q.seek
+                        ));
+                        let port = self.next_port;
+                        self.next_port += 1;
+                        let (r, first) = tftp::start_read(q, from, port, size, &mut |f, at, b| {
+                            p.fw_read(f, at, b)
+                        });
+                        if self.readers.len() >= 8 {
+                            self.readers.remove(0); // abandoned reads: keep the newest
+                        }
+                        self.readers.push(r);
+                        self.send_must(p, qrtr::TYPE_DATA, port, from, &first);
+                    }
+                    Err(e) => {
+                        p.log(format_args!("tftp: refused {:?} ({e})", tftp_name(payload)));
+                        let r = tftp::error(1, "File not found");
+                        self.send_must(p, qrtr::TYPE_DATA, TFTP_PORT, from, &r);
+                    }
+                },
                 tftp::Action::Ignore => {}
             },
+            port if self
+                .readers
+                .iter()
+                .any(|r| r.port == port && r.peer == from) =>
+            {
+                let i = self
+                    .readers
+                    .iter()
+                    .position(|r| r.port == port)
+                    .unwrap_or(0);
+                let (out, done) = tftp::reader(&self.readers[i], payload, &mut |f, at, b| {
+                    p.fw_read(f, at, b)
+                });
+                for d in &out {
+                    self.send_must(p, qrtr::TYPE_DATA, port, from, d);
+                }
+                if done {
+                    let r = self.readers.remove(i);
+                    p.log(format_args!("tftp: read of {} done", r.path));
+                }
+            }
             port if self.clients.iter().any(|c| c.port == port) => self.client(p, port, payload),
             port => {
                 let Some(i) = self.transfers.iter().position(|t| t.port == port) else {
+                    p.log(format_args!(
+                        "qrtr: {} bytes for unserved port {port} from {}:{}, dropped",
+                        payload.len(),
+                        from.0,
+                        from.1
+                    ));
                     return;
                 };
                 let (reply, done) = tftp::transfer(&mut self.transfers[i], payload);
@@ -995,6 +1067,18 @@ impl Modem {
     }
 }
 
+/// The first 40 bytes as hex (a log line must stay under the monitor's 256 bytes).
+struct Hex<'a>(&'a [u8]);
+
+impl fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for b in self.0.iter().take(40) {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 /// One line per packet: direction, type, src -> dst, size, and the QMI header or control words.
 fn trace(p: &mut dyn Platform, dir: &str, h: &Header, payload: &[u8]) {
     let (src, dst) = (h.src_port as i32, h.dst_port as i32);
@@ -1009,19 +1093,21 @@ fn trace(p: &mut dyn Platform, dir: &str, h: &Header, payload: &[u8]) {
     let confirm = if h.confirm_rx != 0 { " confirm" } else { "" };
     match qmi::Msg::parse(payload) {
         Some(m) => p.log(format_args!(
-            "{dir} data {}:{src} -> {}:{dst} {} B qmi type {} id {:#x} txn {}{confirm}",
+            "{dir} data {}:{src} -> {}:{dst} {} B qmi type {} id {:#x} txn {}{confirm} {}",
             h.src_node,
             h.dst_node,
             payload.len(),
             m.ty,
             m.id,
-            m.txn
+            m.txn,
+            Hex(payload)
         )),
         None => p.log(format_args!(
-            "{dir} data {}:{src} -> {}:{dst} {} B{confirm}",
+            "{dir} data {}:{src} -> {}:{dst} {} B{confirm} {}",
             h.src_node,
             h.dst_node,
-            payload.len()
+            payload.len(),
+            Hex(payload)
         )),
     }
 }
