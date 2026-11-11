@@ -1216,7 +1216,7 @@ mod tests {
         );
         assert_eq!(f.sent.len(), 3); // HELLO, locator, TFTP
         assert!(f.nodes.iter().all(|&node| node == 5));
-        let q = qmi::Builder::new(qmi::REQUEST, 3, 0x20)
+        let q = qmi::Builder::new(qmi::REQUEST, 3, 0x21)
             .tlv(1, b"avs/audio")
             .finish();
         let h = Header {
@@ -1338,7 +1338,7 @@ mod tests {
 
     #[test]
     fn refused_storage_and_locator_replies_keep_their_transactions() {
-        for (port, id) in [(RMTFS_PORT, 4), (LOCATOR_PORT, 0x20)] {
+        for (port, id) in [(RMTFS_PORT, 4), (LOCATOR_PORT, 0x21)] {
             let (mut m, mut f) = (modem(), fake());
             let request = qmi::Builder::new(qmi::REQUEST, 7, id)
                 .tlv(1, b"avs/audio")
@@ -1423,7 +1423,7 @@ mod tests {
             ),
         );
         assert_eq!(f.sent.len(), before); // one HELLO per node
-        let q = qmi::Builder::new(qmi::REQUEST, 3, 0x20)
+        let q = qmi::Builder::new(qmi::REQUEST, 3, 0x21)
             .tlv(1, b"avs/audio")
             .finish();
         m.handle(&mut f, &adsp(qrtr::TYPE_DATA, 0x4001, LOCATOR_PORT, &q));

@@ -8,7 +8,9 @@ use alloc::vec::Vec;
 pub const SERVICE: u32 = 64;
 pub const VERSION: u32 = 1;
 pub const INSTANCE: u32 = 1;
-const GET_DOMAIN_LIST: u16 = 0x20;
+/// SERVREG_GET_DOMAIN_LIST_REQ (Linux qcom_pdr_internal.h). It was 0x20 (REGISTER_LISTENER) until 2026-11-12: every
+/// lookup got an error, so the modem never started its WLAN domain (docs wifi.md W0).
+const GET_DOMAIN_LIST: u16 = 0x21;
 const PFR: u16 = 0x24;
 
 /// (domain, QMI instance, the services it provides)
@@ -71,6 +73,22 @@ mod tests {
         assert_eq!(list[0], 1);
         assert_eq!(&list[2..2 + list[1] as usize], b"msm/adsp/audio_pd");
         assert_eq!(&list[2 + 17..2 + 21], &74u32.to_le_bytes());
+    }
+
+    /// The modem's request and Linux's answer, byte for byte (kprobe trace of C1, 2026-11-12)
+    #[test]
+    fn elf_loader_answer_matches_linux() {
+        let req: [u8; 27] = [
+            0x00, 0x04, 0x00, 0x21, 0x00, 0x14, 0x00, 0x01, 0x11, 0x00, b'k', b'e', b'r', b'n',
+            b'e', b'l', b'/', b'e', b'l', b'f', b'_', b'l', b'o', b'a', b'd', b'e', b'r',
+        ];
+        let r = handle(&Msg::parse(&req).unwrap());
+        let linux = "0204000000000010020001001102000100121c0001116d736d2f6d6f64656d2f776c616e5f7064b40000000000000000";
+        let ours: alloc::string::String =
+            r[7..].iter().map(|b| alloc::format!("{b:02x}")).collect();
+        assert_eq!(&r[..3], &[2, 4, 0]); // a response, txn 4
+        assert_eq!(&r[3..5], &[0x21, 0]);
+        assert_eq!(ours, linux);
     }
 
     #[test]
