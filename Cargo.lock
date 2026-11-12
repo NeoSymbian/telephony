@@ -15,4 +15,9 @@ name = "modem-proto"
 version = "0.1.0"
 dependencies = [
  "modem-ipc",
+ "wlfw",
 ]
+
+[[package]]
+name = "wlfw"
+version = "0.1.0"
