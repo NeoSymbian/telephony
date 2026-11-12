@@ -18,7 +18,7 @@ pub mod schedule;
 pub mod ssctl;
 pub mod tftp;
 pub mod voice;
-/// the Wi-Fi firmware's control service client (NeoSymbian/wifi `wlfw`)
+/// the Wi-Fi firmware's control service client (NeoSymbian/neolink `wlfw`)
 pub use wlfw;
 
 pub use modem_ipc;
