@@ -10,5 +10,5 @@ publish = false
 [dependencies]
 modem-ipc = { path = "../modem-ipc" }
 # the Wi-Fi firmware's QMI client lives in NeoSymbian/neolink (owner, 2026-11-12); MODEMD drives it because it owns
-# the modem's QRTR link. shortcut: a path to a sibling checkout while both change together (then a git rev).
-wlfw = { path = "../../../neolink/crates/wlfw" }
+# the modem's QRTR link. Pinned by rev: bump it with neolink changes.
+wlfw = { git = "https://github.com/NeoSymbian/neolink", rev = "838773753fbb0168aec4304551f902b5d13562b3" }

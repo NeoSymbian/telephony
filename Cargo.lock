@@ -21,3 +21,4 @@ dependencies = [
 [[package]]
 name = "wlfw"
 version = "0.1.0"
+source = "git+https://github.com/NeoSymbian/neolink?rev=838773753fbb0168aec4304551f902b5d13562b3#838773753fbb0168aec4304551f902b5d13562b3"
