@@ -37,6 +37,8 @@ const IPA_START: i32 = 0x4e13;
 const FW_READ: i32 = 0x4e1b;
 /// the Wi-Fi firmware's MSA regions to its VMIDs (kernel qcom_telhal.cpp WlanMsa, Wi-Fi W1)
 const WLAN_MSA: i32 = 0x4e1c;
+/// the copy engines, HTC and WMI on the kernel's own thread (qcom_wcn3990.cpp, Wi-Fi W2)
+const WLAN_START: i32 = 0x4e1d;
 /// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
 const VENDOR: u32 = 4;
 const SECTOR: u64 = 512;
@@ -136,6 +138,13 @@ impl Platform for Hal {
                 fs.read_at(f, offset as u64, buf).map_err(ext4_err)
             }),
             None => fw_read(path, offset, buf),
+        }
+    }
+
+    fn wlan_start(&mut self) -> Result<(), i32> {
+        match hal(WLAN_START, core::ptr::null_mut(), core::ptr::null_mut()) {
+            r if r < 0 => Err(r),
+            _ => Ok(()),
         }
     }
 

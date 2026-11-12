@@ -52,6 +52,10 @@ pub trait Platform {
     fn board_data(&mut self, _board_id: u32) -> Vec<u8> {
         Vec::new()
     }
+    /// The firmware is in mission mode: start the host's copy engines, HTC and WMI (kernel HAL WlanStart, W2).
+    fn wlan_start(&mut self) -> Result<(), i32> {
+        Err(-5)
+    }
 }
 
 pub const NODE: u32 = 1;
@@ -962,6 +966,12 @@ impl Modem {
                         ));
                     }
                     wlfw::Step::Ready => p.log(format_args!("wlfw: firmware ready (W1 done)")),
+                    wlfw::Step::Enabled => {
+                        let r = p.wlan_start();
+                        p.log(format_args!(
+                            "wlfw: mission mode; host copy engines start -> {r:?}"
+                        ));
+                    }
                     wlfw::Step::Failed(what, e) => p.log(format_args!("wlfw: {what} failed ({e})")),
                 }
             }

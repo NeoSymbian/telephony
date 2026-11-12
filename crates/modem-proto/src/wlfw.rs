@@ -374,8 +374,10 @@ pub enum Step {
     LoadBoardData,
     /// the firmware said who it is
     Caps(Caps),
-    /// the firmware is ready for WLAN cfg + mission mode (W2)
+    /// the firmware is ready (W1); WLAN cfg + mission mode follow on their own
     Ready,
+    /// WLAN cfg and mission mode accepted: the host starts its copy engines now (W2, kernel WlanStart)
+    Enabled,
     Failed(&'static str, u16),
 }
 
@@ -396,6 +398,9 @@ enum State {
     CalReport,
     /// waiting for the firmware-ready indication
     WaitFwReady,
+    /// WLAN cfg sent, then mission mode (ath10k_snoc_wlan_enable)
+    Cfg,
+    Mode,
     Ready,
     Failed,
 }
@@ -424,6 +429,7 @@ impl Client {
         }
     }
 
+    /// the firmware is up and in mission mode
     pub fn ready(&self) -> bool {
         self.state == State::Ready
     }
@@ -489,8 +495,9 @@ impl Client {
 
     fn maybe_ready(&mut self) -> Vec<Step> {
         if self.state == State::WaitFwReady && self.fw_ready_ind {
-            self.state = State::Ready;
-            return alloc::vec![Step::Ready];
+            self.state = State::Cfg;
+            let t = self.txn();
+            return alloc::vec![Step::Ready, Step::Send(wcn3990_cfg(t))];
         }
         Vec::new()
     }
@@ -529,6 +536,8 @@ impl Client {
                 State::Cap => "capabilities",
                 State::Bdf => "board data",
                 State::CalReport => "calibration report",
+                State::Cfg => "WLAN cfg",
+                State::Mode => "mission mode",
                 _ => "reply",
             };
             return self.fail(what, e);
@@ -579,6 +588,15 @@ impl Client {
             (State::CalReport, CAL_REPORT) => {
                 self.state = State::WaitFwReady;
                 self.maybe_ready()
+            }
+            (State::Cfg, WLAN_CFG) => {
+                self.state = State::Mode;
+                let t = self.txn();
+                alloc::vec![Step::Send(wlan_mode(t, MODE_MISSION))]
+            }
+            (State::Mode, WLAN_MODE) => {
+                self.state = State::Ready;
+                alloc::vec![Step::Enabled]
             }
             _ => Vec::new(),
         }
@@ -747,7 +765,18 @@ mod tests {
         assert!(c.message(&reply(sent(&s)).finish()).is_empty());
         assert!(!c.ready());
         let ind = Builder::new(INDICATION, 0, FW_READY_IND).finish();
-        assert_eq!(c.message(&ind), alloc::vec![Step::Ready]);
+        let s = c.message(&ind);
+        assert_eq!(s[0], Step::Ready);
+        let Step::Send(cfg) = &s[1] else { panic!() };
+        assert_eq!(Msg::parse(cfg).unwrap().id, WLAN_CFG);
+        let s = c.message(&reply(cfg).finish());
+        let p = Msg::parse(sent(&s)).unwrap();
+        assert_eq!((p.id, p.u32(0x01)), (WLAN_MODE, Some(MODE_MISSION)));
+        assert!(!c.ready());
+        assert_eq!(
+            c.message(&reply(sent(&s)).finish()),
+            alloc::vec![Step::Enabled]
+        );
         assert!(c.ready());
     }
 
