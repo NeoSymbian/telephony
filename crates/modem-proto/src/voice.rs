@@ -2,7 +2,7 @@
 //! QMI VOICE (service 9, v2): calls (docs/telephony.md C5). Message ids and TLV layouts from libqmi's
 //! `qmi-service-voice.json` (facts), checked against the C1 capture where it had them (incoming calls: the All Call
 //! Status indications, Answer, End); Dial is from libqmi only.
-//! shortcut: one call at a time, no DTMF, hold or waiting calls; C7 adds them.
+//! C7 parses the complete indication atomically; malformed/overflowing lists never replace a live snapshot.
 
 use crate::qmi::Msg;
 use alloc::string::String;
@@ -13,6 +13,7 @@ pub const DIAL: u16 = 0x20;
 pub const END: u16 = 0x21;
 pub const ANSWER: u16 = 0x22;
 pub const ALL_CALL_STATUS_IND: u16 = 0x2e;
+pub const MANAGE_CALLS: u16 = 0x31;
 /// a keypad tone to the far end while held (libqmi Start/Stop Continuous DTMF: TLV 1 {call id, digit} / {call id})
 pub const START_CONT_DTMF: u16 = 0x29;
 pub const STOP_CONT_DTMF: u16 = 0x2a;
@@ -33,26 +34,40 @@ pub struct CallInfo {
 /// TLV 0x01 = a count, then 7 bytes per call {id, state, type, direction, mode, multipart, als}; TLV 0x10 = the
 /// remote numbers: a count, then {call id, presentation, u8 length, digits}.
 pub fn all_call_status(m: &Msg) -> Option<CallInfo> {
+    all_calls(m)?.into_iter().next()
+}
+
+pub fn all_calls(m: &Msg) -> Option<alloc::vec::Vec<CallInfo>> {
     let t = m.tlv(0x01)?;
-    let c = t.get(1..8).filter(|_| t[0] > 0)?;
-    let mut call = CallInfo {
-        id: c[0],
-        state: c[1],
-        incoming: c[3] == 2,
-        number: None,
-    };
+    let count = usize::from(*t.first()?);
+    if count > modem_ipc::MAX_CALLS {
+        return None;
+    }
+    let entries = t.get(1..1 + 7 * count)?;
+    let mut calls = alloc::vec::Vec::with_capacity(count);
+    for c in entries.as_chunks::<7>().0 {
+        if c[0] == 0 || calls.iter().any(|x: &CallInfo| x.id == c[0]) {
+            return None;
+        }
+        calls.push(CallInfo {
+            id: c[0],
+            state: c[1],
+            incoming: c[3] == 2,
+            number: None,
+        });
+    }
     if let Some(r) = m.tlv(0x10) {
         let mut at = 1;
         for _ in 0..*r.first()? {
-            let len = *r.get(at + 2)? as usize;
+            let len = usize::from(*r.get(at + 2)?);
             let digits = r.get(at + 3..at + 3 + len)?;
-            if r[at] == call.id {
-                call.number = core::str::from_utf8(digits).ok().map(String::from);
+            if let Some(c) = calls.iter_mut().find(|c| c.id == r[at]) {
+                c.number = core::str::from_utf8(digits).ok().map(String::from);
             }
             at += 3 + len;
         }
     }
-    Some(call)
+    Some(calls)
 }
 
 /// A number we may dial: digits with an optional leading `+`, `*` and `#`, at least 5 digits. The length floor keeps
