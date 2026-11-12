@@ -438,10 +438,9 @@ impl Daemon {
             m.lost();
         }
         if self.modem.is_some() && self.recovery_attempt < 3 {
-            // a modem failure restarts the modem only while the ADSP is healthy and quiet (as for a FATAL): stopping
-            // a healthy ADSP once never returned and froze the phone (2026-11-12, after a failed modem reboot)
-            let mask = recovery::recovery_mask(adsp::processor_state(), self.audio.apr.quiescent());
-            self.recover(mask);
+            // a modem failure restarts the modem only: the ADSP's TrustZone shutdown (PAS) never returned on the phone
+            // and froze it (2026-11-12); only the ADSP's own faults may stop it
+            self.recover(1);
         }
     }
 
@@ -887,11 +886,15 @@ impl Daemon {
                 }
             }
         }
-        if self.healthy_since == 0 {
-            self.healthy_since = now;
-        }
-        if now.saturating_sub(self.healthy_since) >= 60_000 {
-            self.recovery_attempt = 0;
+        // a minute of a *running* modem earns new recovery attempts: run() also runs while a failing modem boots,
+        // and counting that time reset the attempts and escalated to stopping the ADSP (froze the phone 2026-11-12)
+        if running {
+            if self.healthy_since == 0 {
+                self.healthy_since = now;
+            }
+            if now.saturating_sub(self.healthy_since) >= 60_000 {
+                self.recovery_attempt = 0;
+            }
         }
         if talking {
             self.audio.test = None;
