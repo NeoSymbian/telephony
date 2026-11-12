@@ -361,9 +361,17 @@ impl Daemon {
         if matches!(self.phase, Phase::Recover { .. }) {
             return;
         }
-        // shortcut: an ADSP-only restart (mask 2) would leave a running modem to be booted again; the modem always
-        // restarts too (recovery_mask never asks for 2 alone today)
-        let mask = mask | 1;
+        // shortcut: the ADSP is never stopped. Its TrustZone PAS shutdown never returned on the phone and froze it
+        // (2026-11-12, three times: after a failed modem restart, then from Retry), so every recovery restarts the
+        // modem only, whatever the caller asked for; a lost ADSP means no call audio until a reboot. Upgrade when
+        // the PAS shutdown hang is understood.
+        if mask & 2 != 0 {
+            dprintln!(
+                "[modemd] recovery: keeping the ADSP (asked mask {}); restarting the modem only",
+                mask
+            );
+        }
+        let mask = 1;
         // nothing more goes to the processors being stopped; the ADSP side survives for a modem-only stop
         if let Some(m) = &mut self.modem {
             m.lost();
@@ -1252,7 +1260,7 @@ impl Service for Daemon {
                     err::KERR_IN_USE
                 } else {
                     self.recovery_attempt = 0;
-                    self.recover(3);
+                    self.recover(1); // the modem only (recover() never stops the ADSP)
                     0
                 }
             }
