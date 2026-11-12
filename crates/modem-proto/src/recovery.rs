@@ -26,6 +26,13 @@ pub fn stop_progress(state: Result<[u32; 4], i32>, elapsed_ms: u64) -> StopProgr
     }
 }
 
+/// True when `level` turns on: `latch` keeps the last level seen.
+pub fn rising(latch: &mut bool, level: bool) -> bool {
+    let edge = level && !*latch;
+    *latch = level;
+    edge
+}
+
 /// A lost state read or an incomplete ADSP/channel state cannot justify retaining that processor.
 pub fn recovery_mask(adsp: Result<[u32; 4], i32>, apr_quiescent: bool) -> u32 {
     // READY (bit 1) is a positive remote signal; cached step/channels alone do not prove health.
@@ -95,5 +102,14 @@ mod tests {
             assert_eq!(recovery_mask(state, true), 3);
         }
         assert_eq!(recovery_mask(Ok([4, 0, 6, 3]), false), 3);
+    }
+
+    #[test]
+    fn fatal_counts_once_until_it_clears() {
+        let mut latch = false;
+        assert!(rising(&mut latch, true));
+        assert!(!rising(&mut latch, true)); // still set after the stop: not a new fault
+        assert!(!rising(&mut latch, false));
+        assert!(rising(&mut latch, true));
     }
 }

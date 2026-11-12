@@ -11,6 +11,12 @@ publish = false
 crate-type = ["staticlib"]
 test = false
 
+[features]
+# Startup-only diagnostic build: never boot MSS or request radio online; ADSP/loopback remain available.
+radio-disabled = []
+# Diagnostic build: log every QRTR packet with its first 40 payload bytes (docs wifi.md W0).
+qrtr-trace = []
+
 [dependencies]
 e32.workspace = true
 modem-proto.workspace = true

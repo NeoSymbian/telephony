@@ -339,13 +339,13 @@ impl CallAudio {
         if self.ring_loaded {
             return Ok(());
         }
-        let (r, info) = hal_io(0x4e1c, Io::default());
+        let (r, info) = hal_io(crate::AUDIO_MEM, Io::default());
         if r < 0 {
             return Err(r);
         }
         let pcm = modem_proto::apr::ring_pcm(self.ring.volume);
         let (r, _) = hal_io(
-            0x4e1c,
+            crate::AUDIO_MEM,
             Io {
                 a: 1,
                 b: 0,
@@ -368,7 +368,10 @@ impl CallAudio {
             self.ring_loaded = false;
         }
         let mut log = |a: core::fmt::Arguments| dprintln!("[modemd t={}ms] {}", time::millis(), a);
-        while let Some(n) = recv(RING_APR, buf) {
+        for _ in 0..32 {
+            let Some(n) = recv(RING_APR, buf) else {
+                break;
+            };
             self.apr.handle(&buf[..n], &mut log);
         }
         loop {
@@ -382,7 +385,7 @@ impl CallAudio {
                 }
                 modem_proto::apr::Out::Publish => {
                     let (r, info) = hal_io(
-                        0x4e1c,
+                        crate::AUDIO_MEM,
                         Io {
                             a: 2,
                             ..Io::default()
@@ -396,7 +399,7 @@ impl CallAudio {
                 }
                 modem_proto::apr::Out::Complete(ticket, generation) => {
                     let r = hal_io(
-                        0x4e1c,
+                        crate::AUDIO_MEM,
                         Io {
                             a: 3,
                             b: ticket,

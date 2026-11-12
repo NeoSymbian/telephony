@@ -10,6 +10,7 @@ extern crate alloc;
 
 mod adsp;
 
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
@@ -33,9 +34,21 @@ const RECV: i32 = 0x4e10;
 const PART_READ: i32 = 0x4e11;
 const RMTFS_MEM: i32 = 0x4e12;
 const IPA_START: i32 = 0x4e13;
-const RPROC_STOP: i32 = 0x4e1a;
-const RPROC_STATE: i32 = 0x4e1b;
-const HAPTIC: i32 = 0x4e1d;
+/// a file of modem_a's FAT16 (kernel qcom_telhal.cpp FwRead): TFTP's /readonly/firmware/image/ (Wi-Fi W0)
+const FW_READ: i32 = 0x4e1b;
+/// the Wi-Fi firmware's MSA regions to its VMIDs (kernel qcom_telhal.cpp WlanMsa, Wi-Fi W1)
+const WLAN_MSA: i32 = 0x4e1c;
+/// the copy engines, HTC and WMI on the kernel's own thread (qcom_wcn3990.cpp, Wi-Fi W2)
+const WLAN_START: i32 = 0x4e1d;
+// C7's HALs (kernel qcom_telhal.cpp): after Wi-Fi's 0x4e1b-0x4e1f, UsbNet's reserved 0x4e20-0x4e22 and Prng 0x4e23
+/// stop the modem and/or the ADSP {mask 1 MSS, 2 ADSP}, asynchronously
+const RPROC_STOP: i32 = 0x4e24;
+/// that stop's progress {phase, error, mss generation, adsp generation}
+const RPROC_STATE: i32 = 0x4e25;
+/// the ringtone's audio memory for the ADSP (adsp.rs)
+pub(crate) const AUDIO_MEM: i32 = 0x4e26;
+/// the vibration motor {ms, amplitude}; 0 stops it
+const HAPTIC: i32 = 0x4e27;
 /// PartRead's index of vendor_a (the IPA firmware, read-only through ext4ro)
 const VENDOR: u32 = 4;
 const SECTOR: u64 = 512;
@@ -90,17 +103,12 @@ impl Platform for Hal {
         if node != MODEM_NODE {
             return adsp::send(adsp::RING_QRTR, packet); // the ADSP's router (C6)
         }
-        // no receive intent from the modem yet: retry briefly, never long (a 100 s block lost the modem's
-        // announcements, UIM among them: C6 2026-11-09)
-        for _ in 0..10 {
-            let r = hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8);
-            match r {
-                NOT_READY => time::sleep(20_000), // e32 sleeps in microseconds: 20 ms, at most 200 ms in all
-                r if r < 0 => return Err(r),
-                _ => return Ok(()),
-            }
+        // No userspace retry sleeps: mandatory packets use the ordered outbox. The synchronous kernel HAL
+        // may still wait for a receive intent; this is not a hard real-time send deadline.
+        match hal(SEND, packet.as_ptr() as *mut u8, packet.len() as *mut u8) {
+            r if r < 0 => Err(r),
+            _ => Ok(()),
         }
-        Err(NOT_READY)
     }
 
     fn rmtfs_read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), i32> {
@@ -132,6 +140,124 @@ impl Platform for Hal {
     fn log(&mut self, args: fmt::Arguments) {
         dprintln!("[modemd t={}ms] {}", time::millis(), args);
     }
+
+    fn fw_size(&mut self, path: &str) -> Result<usize, i32> {
+        match path.strip_prefix("vendor/") {
+            Some(p) => vendor_file(p, |fs, f| Ok(fs_size(fs, f))),
+            None => fw_read(path, 0, &mut []),
+        }
+    }
+
+    fn fw_read(&mut self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
+        match path.strip_prefix("vendor/") {
+            Some(p) => vendor_file(p, |fs, f| {
+                fs.read_at(f, offset as u64, buf).map_err(ext4_err)
+            }),
+            None => fw_read(path, offset, buf),
+        }
+    }
+
+    fn wlan_start(&mut self) -> Result<(), i32> {
+        match hal(WLAN_START, core::ptr::null_mut(), core::ptr::null_mut()) {
+            r if r < 0 => Err(r),
+            _ => Ok(()),
+        }
+    }
+
+    fn wlan_msa(&mut self, regions: &[modem_proto::wlfw::Region]) -> Result<(), i32> {
+        for r in regions {
+            let io = Io {
+                a: 1,
+                b: r.addr as u32,
+                len: r.size,
+                buf: r.secure as u32,
+            };
+            let e = hal_io(WLAN_MSA, io).0;
+            if e < 0 {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// The board data on vendor_a: Pixel 3a XL's `firmware/bdwlan-bonito.bin` (the factory image also has -ROW,
+    /// -USA, -JPN, -VZW regional variants and the 3a's -sargo set), else the generic names.
+    /// shortcut: the board name and the default (non-regional) file are fixed; pick by device and region before release.
+    fn board_data(&mut self, board_id: u32) -> Vec<u8> {
+        let names = [
+            String::from("firmware/bdwlan-bonito.bin"),
+            alloc::format!("firmware/bdwlan.b{:02x}", board_id & 0xff),
+            String::from("firmware/bdwlan.bin"),
+        ];
+        for n in &names {
+            let got = vendor_file(n, |fs, f| {
+                if f.size > 0x10_0000 {
+                    return Err(-9); // KErrOverflow: a board file is tens of KB
+                }
+                fs.read(f).map_err(ext4_err)
+            });
+            match got {
+                Ok(d) => {
+                    dprintln!("[modemd] wlfw: board data from {n}");
+                    return d;
+                }
+                Err(e) => dprintln!("[modemd] wlfw: no {n} ({e})"),
+            }
+        }
+        Vec::new()
+    }
+}
+
+fn ext4_err(e: ext4ro::Error) -> i32 {
+    match e {
+        ext4ro::Error::Io(e) => e,
+        ext4ro::Error::NotFound => -1, // KErrNotFound
+        _ => -20,                      // KErrCorrupt
+    }
+}
+
+fn fs_size(_: &mut ext4ro::Fs<Vendor>, f: &ext4ro::Inode) -> usize {
+    f.size as usize
+}
+
+/// The vendor_a file the modem is reading, kept open between its TFTP blocks (one lookup per file, not per block)
+struct OpenFile(core::cell::RefCell<Option<(String, ext4ro::Fs<Vendor>, ext4ro::Inode)>>);
+// SAFETY: only the daemon's one thread serves TFTP (Platform calls come from its loop).
+unsafe impl Sync for OpenFile {}
+static OPEN: OpenFile = OpenFile(core::cell::RefCell::new(None));
+
+fn vendor_file<T>(
+    path: &str,
+    f: impl FnOnce(&mut ext4ro::Fs<Vendor>, &ext4ro::Inode) -> Result<T, i32>,
+) -> Result<T, i32> {
+    let mut open = OPEN.0.borrow_mut();
+    if open.as_ref().is_none_or(|o| o.0 != path) {
+        *open = None;
+        let mut fs = ext4ro::Fs::open(Vendor).map_err(ext4_err)?;
+        let file = fs.find(path).map_err(ext4_err)?;
+        *open = Some((String::from(path), fs, file));
+    }
+    let o = open.as_mut().ok_or(-1)?;
+    f(&mut o.1, &o.2)
+}
+
+/// HAL FwRead: `path` ("IMAGE/WLANMDSP.MBN") as a NUL-terminated 32-byte buffer; an empty `buf` asks for the size
+fn fw_read(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, i32> {
+    let mut name = [0u8; 32];
+    if path.len() >= name.len() {
+        return Err(-6); // KErrArgument
+    }
+    name[..path.len()].copy_from_slice(path.as_bytes());
+    let mut io = Io {
+        a: 0,
+        b: offset as u32,
+        len: buf.len() as u32,
+        buf: buf.as_mut_ptr() as u32,
+    };
+    match hal(FW_READ, (&mut io as *mut Io).cast(), name.as_mut_ptr()) {
+        r if r < 0 => Err(r),
+        r => Ok(r as usize),
+    }
 }
 
 enum Phase {
@@ -153,6 +279,8 @@ enum Phase {
         watchdog: Option<i32>,
     },
     Failed,
+    /// Startup radio-disabled build: ADSP services remain active.
+    Disabled,
 }
 
 struct Daemon {
@@ -168,7 +296,7 @@ struct Daemon {
     fatal_seen: bool,
     /// the kernel runs IPA: LTE allowed, the IPA handshake on (else voice-only)
     ipa_up: bool,
-    /// the audio DSP (C6): loaded once the modem runs
+    /// the audio DSP: serviced independently of radio preparation and failures
     adsp: adsp::Adsp,
     /// the call's audio path and the in-call buttons' settings (C6)
     audio: adsp::CallAudio,
@@ -184,6 +312,8 @@ struct Daemon {
     waiting_alert: Option<u8>,
     audio_seen: Option<(Mode, Mode, bool)>,
     haptic_error: i32,
+    /// a failed ringtone preparation is retried from here (ms)
+    ring_retry_at: u64,
 }
 
 impl Daemon {
@@ -230,6 +360,13 @@ impl Daemon {
     fn recover(&mut self, mask: u32) {
         if matches!(self.phase, Phase::Recover { .. }) {
             return;
+        }
+        // shortcut: an ADSP-only restart (mask 2) would leave a running modem to be booted again; the modem always
+        // restarts too (recovery_mask never asks for 2 alone today)
+        let mask = mask | 1;
+        // nothing more goes to the processors being stopped; the ADSP side survives for a modem-only stop
+        if let Some(m) = &mut self.modem {
+            m.lost();
         }
         if self.recovery_attempt >= 3 {
             self.phase = Phase::Failed;
@@ -298,7 +435,7 @@ impl Daemon {
         self.phase = Phase::Failed;
         self.status.modem = modem_ipc::modem::FAILED;
         if let Some(m) = &mut self.modem {
-            m.status.modem = modem_ipc::modem::FAILED;
+            m.lost();
         }
         if self.modem.is_some() && self.recovery_attempt < 3 {
             self.recover(3);
@@ -307,6 +444,8 @@ impl Daemon {
 
     /// One step of the work: Err(KErrNotSupported) when this machine has no modem (QEMU/Syborg).
     fn step(&mut self) -> Result<(), i32> {
+        self.adsp.step();
+        self.run();
         match self.phase {
             Phase::Ipa => {
                 match ipa_firmware() {
@@ -328,7 +467,11 @@ impl Daemon {
                         );
                         self.ipa_up = r == 0;
                     }
-                    Err(ext4ro::Error::Io(e)) if e == err::KERR_NOT_SUPPORTED => return Err(e),
+                    Err(ext4ro::Error::Io(e))
+                        if e == err::KERR_NOT_SUPPORTED && !matches!(self.adsp, adsp::Adsp::Up) =>
+                    {
+                        return Err(e);
+                    }
                     Err(e) => dprintln!("[modemd] ipa: no firmware from vendor_a ({:?})", e),
                 }
                 self.phase = Phase::Read(0); // the modem boots either way
@@ -345,7 +488,7 @@ impl Daemon {
                         buf: v.as_mut_ptr() as u32,
                     },
                 );
-                if r == err::KERR_NOT_SUPPORTED {
+                if r == err::KERR_NOT_SUPPORTED && !matches!(self.adsp, adsp::Adsp::Up) {
                     return Err(r);
                 }
                 if r < 0 {
@@ -359,17 +502,21 @@ impl Daemon {
                     self.boot();
                 }
             }
+            // (the top of step() already stepped the ADSP and serviced its rings)
             Phase::Adsp => {
-                self.adsp.step();
-                if let Some(m) = &mut self.modem {
-                    while let Some(n) = adsp::recv(adsp::RING_QRTR, &mut self.rx) {
-                        m.handle(&mut Hal, &self.rx[..n]);
+                if !self.adsp.busy() {
+                    if matches!(self.adsp, adsp::Adsp::Failed) {
+                        // no audio, but the radio still starts (PR #2)
+                        dprintln!("[modemd] ADSP unavailable; starting the radio without it");
                     }
-                }
-                if matches!(self.adsp, adsp::Adsp::Failed) {
-                    self.fail("ADSP boot", NOT_READY);
-                } else if !self.adsp.busy() {
-                    self.boot_modem();
+                    if cfg!(feature = "radio-disabled") {
+                        self.phase = Phase::Disabled;
+                    } else if self.modem.as_ref().is_some_and(Modem::radio_attached) {
+                        // a recovery restarted the ADSP: the radio storage is still attached, the modem boots again
+                        self.boot_modem();
+                    } else {
+                        self.phase = Phase::Ipa;
+                    }
                 }
             }
             Phase::Wait(t0) => {
@@ -395,7 +542,6 @@ impl Daemon {
                     self.fail("modem boot (60 s)", NOT_READY);
                 }
             }
-            Phase::Running => self.run(),
             Phase::Recover {
                 mask,
                 since,
@@ -478,7 +624,7 @@ impl Daemon {
                                 m.reset(mask & 2 == 0);
                             }
                             self.audio = adsp::CallAudio::new();
-                            self.fatal_seen = false;
+                            // fatal_seen stays: a FATAL bit the kernel left set is not a new fault
                             if mask & 2 != 0 {
                                 self.adsp = adsp::Adsp::Idle;
                                 self.phase = Phase::Adsp;
@@ -489,7 +635,7 @@ impl Daemon {
                     }
                 }
             }
-            Phase::Failed => {}
+            Phase::Running | Phase::Failed | Phase::Disabled => {}
         }
         Ok(())
     }
@@ -559,17 +705,26 @@ impl Daemon {
             info.b,
             info.len
         );
+        if info.len < 0x20_0000 {
+            self.fail("rmtfs carve-out size", err::KERR_ARGUMENT);
+            return;
+        }
         let images = core::mem::take(&mut self.images);
-        let mut modem = Modem::new(images, info.b as u64);
-        modem.ipa_up = self.ipa_up;
-        modem.status.airplane = self.status.airplane;
-        modem.status.ring = self.status.ring;
-        modem.status.pin_attempts = 255;
-        self.modem = Some(modem);
-        self.phase = Phase::Adsp;
+        if let Some(modem) = &mut self.modem {
+            if let Err(e) = modem.attach_radio(images, info.b as u64) {
+                self.fail("radio storage attachment", e);
+                return;
+            }
+            modem.ipa_up = self.ipa_up;
+        }
+        self.boot_modem();
     }
 
     fn boot_modem(&mut self) {
+        if cfg!(feature = "radio-disabled") {
+            self.phase = Phase::Disabled;
+            return;
+        }
         let r = hal(BOOT, core::ptr::null_mut(), core::ptr::null_mut());
         if r < 0 {
             self.fail("modem boot start", r);
@@ -578,21 +733,33 @@ impl Daemon {
         self.phase = Phase::Wait(time::millis());
     }
 
+    /// Every step, in every phase (the ADSP serves audio before and without the radio, PR #2). The health checks
+    /// and the watchdog only judge a running modem; during a recovery nothing is sent to the processors being stopped.
     fn run(&mut self) {
-        let st = match state() {
-            Ok(s) => s,
-            Err(e) => {
-                dprintln!(
-                    "[modemd t={}ms] modem state unavailable ({})",
-                    time::millis(),
-                    e
-                );
-                self.recover(3);
-                return;
+        if matches!(self.phase, Phase::Recover { .. }) {
+            return;
+        }
+        let running = matches!(self.phase, Phase::Running);
+        let st = if running {
+            match state() {
+                Ok(s) => s,
+                Err(e) => {
+                    dprintln!(
+                        "[modemd t={}ms] modem state unavailable ({})",
+                        time::millis(),
+                        e
+                    );
+                    self.recover(3);
+                    return;
+                }
             }
+        } else {
+            [0; 4]
         };
-        let dsp = adsp::processor_state();
-        if st[2] & FATAL != 0 {
+        // FATAL counts on its rising edge, observed while running: a bit the kernel leaves set after a stop must not
+        // restart the modem again and again (the latch keeps its value outside Running)
+        if running && recovery::rising(&mut self.fatal_seen, st[2] & FATAL != 0) {
+            let dsp = adsp::processor_state();
             let quiescent = self.audio.apr.quiescent();
             let mask = recovery::recovery_mask(dsp, quiescent);
             dprintln!(
@@ -605,20 +772,27 @@ impl Daemon {
             self.recover(mask);
             return;
         }
-        if !matches!(dsp, Ok(s) if s[2] & FATAL == 0 && s[1] == 0) {
-            dprintln!("[modemd t={}ms] ADSP unavailable {:?}", time::millis(), dsp);
-            self.recover(3);
-            return;
-        }
-        if self.audio.apr.failed_hard() {
-            self.recover(3);
-            return;
+        if running && matches!(self.adsp, adsp::Adsp::Up) {
+            // only an ADSP that was up can be lost: a missing one never takes the radio down (PR #2)
+            let dsp = adsp::processor_state();
+            if !matches!(dsp, Ok(s) if s[2] & FATAL == 0 && s[1] == 0) {
+                dprintln!("[modemd t={}ms] ADSP unavailable {:?}", time::millis(), dsp);
+                self.recover(3);
+                return;
+            }
+            if self.audio.apr.failed_hard() {
+                self.recover(3);
+                return;
+            }
         }
         let Some(modem) = &mut self.modem else {
             return;
         };
         let buf = &mut self.rx;
-        loop {
+        for _ in 0..32 {
+            if !matches!(self.phase, Phase::Running) {
+                break;
+            }
             let r = hal(RECV, buf.as_mut_ptr(), buf.len() as *mut u8);
             if r == NOT_READY {
                 break;
@@ -629,7 +803,10 @@ impl Daemon {
             }
             modem.handle(&mut Hal, &buf[..r as usize]);
         }
-        while let Some(n) = adsp::recv(adsp::RING_QRTR, buf) {
+        for _ in 0..32 {
+            let Some(n) = adsp::recv(adsp::RING_QRTR, buf) else {
+                break;
+            };
             modem.handle(&mut Hal, &buf[..n]);
         }
         // the audio follows what is wanted now: a connected call's voice path, else the test, else nothing (the
@@ -722,12 +899,17 @@ impl Daemon {
             && !modem.status.airplane
             && !modem.status.ring.silent
             && modem.status.ring.volume > 0;
-        let ring_ready = if ring_wanted && self.audio.apr.is() == Mode::Off && self.audio.apr.idle()
+        let ring_ready = if ring_wanted
+            && self.audio.apr.is() == Mode::Off
+            && self.audio.apr.idle()
+            && now >= self.ring_retry_at
         {
             match self.audio.prepare_ring() {
                 Ok(()) => true,
                 Err(e) => {
+                    // the vibration still alerts; the tone is tried again in 2 s, not every step
                     modem.status.result = e;
+                    self.ring_retry_at = now + 2000;
                     false
                 }
             }
@@ -767,7 +949,7 @@ impl Daemon {
         }
         let now = time::millis();
         modem.tick(&mut Hal, now);
-        if now - self.last_log >= STATUS_LOG_MS {
+        if matches!(self.phase, Phase::Running) && now - self.last_log >= STATUS_LOG_MS {
             self.last_log = now;
             let s = st;
             let st = modem.status;
@@ -781,7 +963,7 @@ impl Daemon {
                 st.call.state
             );
         }
-        if modem.watchdog() {
+        if running && modem.watchdog() {
             self.recover(3);
         }
     }
@@ -892,10 +1074,15 @@ impl Service for Daemon {
             msg.complete(r);
             return;
         }
+        let audio_op = matches!(
+            msg.function(),
+            op::MUTE | op::SPEAKER | op::VOLUME | op::AUDIO_TEST
+        );
         if !matches!(
             msg.function(),
-            op::STATUS | op::CANCEL_NOTIFY | op::RETRY | op::RING_SETTINGS
+            op::STATUS | op::CANCEL_NOTIFY | op::RETRY | op::RING_SETTINGS | op::AIRPLANE
         ) && !matches!(self.phase, Phase::Running)
+            && !(audio_op && matches!(self.adsp, adsp::Adsp::Up))
         {
             msg.complete(NOT_READY);
             return;
@@ -1107,11 +1294,16 @@ fn main() -> i32 {
             return 0;
         }
     };
-    dprintln!("[modemd] start: serving NeoModem, reading the EFS partitions");
+    dprintln!("[modemd] start: serving NeoModem, starting ADSP before radio preparation");
     let mut d = Daemon {
-        phase: Phase::Ipa,
+        phase: Phase::Adsp,
         images: Default::default(),
-        modem: None,
+        modem: Some({
+            let mut router = Modem::support_only();
+            router.radio_enabled = !cfg!(feature = "radio-disabled");
+            router.trace = cfg!(feature = "qrtr-trace"); // every QRTR packet in the log (Wi-Fi W0)
+            router
+        }),
         rx: vec![0u8; 0x2000],
         status: Status::default(),
         t0: 0,
@@ -1131,6 +1323,7 @@ fn main() -> i32 {
         waiting_alert: None,
         audio_seen: None,
         haptic_error: 0,
+        ring_retry_at: 0,
     };
     // Ordinary C: settings only; modem EFS remains RAM-backed (G4).
     if let Ok(fs) = e32::fs::Fs::connect() {
@@ -1150,13 +1343,32 @@ fn main() -> i32 {
             }
         }
     }
+    // the modem exists from startup (ADSP service first), so the saved intent goes to it before any radio work
+    if let Some(m) = &mut d.modem {
+        m.status.airplane = d.status.airplane;
+        m.status.ring = d.status.ring;
+    }
     d.publish();
     rt::block_on(async {
         let mut receive = pin!(server.receive());
+        let mut pump =
+            modem_proto::schedule::PumpDeadline::new(time::millis(), (LOOP_US / 1000) as u64);
         loop {
+            if pump.due(time::millis()) {
+                if let Err(e) = d.step() {
+                    dprintln!("[modemd] no modem on this machine ({}): exiting", e);
+                    return e;
+                }
+                pump.completed(time::millis());
+            }
             // one step every 10 ms: the rings are polled (e32 delays are in microseconds; the old "20 ms / 2 s"
             // were 20 us / 2 ms, C6 2026-11-09)
-            match rt::select(receive.as_mut(), time::delay(LOOP_US)).await {
+            match rt::select(
+                receive.as_mut(),
+                time::delay(pump.wait_us(time::millis()).max(1)),
+            )
+            .await
+            {
                 Either::Left(Ok(msg)) => {
                     receive.set(server.receive());
                     let _ = server::dispatch(&mut d, msg);
@@ -1165,12 +1377,7 @@ fn main() -> i32 {
                     dprintln!("[modemd] receive failed ({})", e);
                     receive.set(server.receive());
                 }
-                Either::Right(()) => {
-                    if let Err(e) = d.step() {
-                        dprintln!("[modemd] no modem on this machine ({}): exiting", e);
-                        return e;
-                    }
-                }
+                Either::Right(()) => {}
             }
             d.publish();
         }

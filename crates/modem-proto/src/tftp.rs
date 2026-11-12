@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! TFTP over QRTR (service 4096), what the modem uses for its config files. Each transfer runs on a fresh local
-//! port. Reads are refused ("not found": under Linux in C1 every one the modem tried failed and calls still worked);
-//! writes are kept in RAM (C1: /readwrite/server_check.txt).
+//! port. Writes are kept in RAM (C1: /readwrite/server_check.txt). Reads are served only from the modem's firmware
+//! partitions, read-only: `/readonly/firmware/image/X` = modem_a `IMAGE/X` (the folder Linux tqftpserv maps to the
+//! remoteproc firmware) and `/readonly/vendor/firmware/X` = vendor_a `firmware/X`. The modem's WLAN domain loads `wlanmdsp.mbn` that way, with `rsize`/`seek` reads in
+//! `wsize`-block windows (Linux kprobe trace, docs wifi.md W0). Every other read is refused, as under Linux in C1.
 //! Written from linux-msm tqftpserv (`tqftpserv.c`, BSD-3) and RFC 1350/2347/2348.
 
 use alloc::string::String;
@@ -26,13 +28,211 @@ pub struct Transfer {
     pub data: Vec<u8>,
 }
 
+/// A read in progress: a firmware file, served the way tqftpserv's `handle_reader` does.
+pub struct Reader {
+    pub port: u32,
+    pub peer: (u32, u32),
+    /// the FAT path on modem_a ("IMAGE/WLANMDSP.MBN")
+    pub path: String,
+    pub blksize: usize,
+    pub wsize: usize,
+    /// bytes asked for (0 = not given: tqftpserv then sends one block)
+    pub rsize: usize,
+    pub seek: usize,
+}
+
+/// An RRQ for a file we serve: where it lives and the options the modem asked for.
+pub struct ReadRequest {
+    pub path: String,
+    pub blksize: usize,
+    pub wsize: usize,
+    pub rsize: usize,
+    /// `None` without a seek option
+    pub seek: Option<usize>,
+    pub timeoutms: Option<u32>,
+    pub tsize: bool,
+    /// any option at all: answer with an OACK, else with block 1
+    pub options: bool,
+}
+
 /// What a packet asks the router to do.
 pub enum Action {
     /// reply from the service's own port
     Reply(Vec<u8>),
     /// open a transfer port and send this from it
     Start(Transfer, Vec<u8>),
+    /// a read of a firmware file: the router looks the file up and calls `start_read`
+    Read(ReadRequest),
     Ignore,
+}
+
+/// Reads `buf.len()` bytes of firmware file `path` at an offset: how many it got (fewer at the end).
+pub type ReadFn<'a> = dyn FnMut(&str, usize, &mut [u8]) -> Result<usize, i32> + 'a;
+
+const FW_PREFIX: &str = "/readonly/firmware/image/";
+const VENDOR_PREFIX: &str = "/readonly/vendor/firmware/";
+
+/// Where a read-only firmware file lives:
+/// - `/readonly/firmware/image/name.ext` -> modem_a `IMAGE/NAME.EXT` (FAT16, an 8.3 name);
+/// - `/readonly/vendor/firmware/name` -> vendor_a `vendor/firmware/name` (ext4; the phone keeps `wlanmdsp.mbn`
+///   there, not on modem_a: W0, 2026-11-12).
+///
+/// Nothing else: no subfolders, no `..`.
+pub fn firmware_path(name: &str) -> Option<String> {
+    let plain = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-.".contains(&c))
+    };
+    if let Some(file) = name.strip_prefix(VENDOR_PREFIX) {
+        return (plain(file) && file.len() <= 64 && !file.starts_with('.'))
+            .then(|| alloc::format!("vendor/firmware/{file}"));
+    }
+    let file = name.strip_prefix(FW_PREFIX)?;
+    let (base, ext) = file.split_once('.').unwrap_or((file, ""));
+    let ok = |s: &str, max: usize| {
+        s.len() <= max
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    };
+    if base.is_empty() || !ok(base, 8) || !ok(ext, 3) {
+        return None;
+    }
+    Some(alloc::format!("IMAGE/{}", file.to_ascii_uppercase()))
+}
+
+fn number(v: &[u8]) -> Option<usize> {
+    core::str::from_utf8(v).ok()?.parse().ok()
+}
+
+fn read_request(name: &str, s: &[&[u8]]) -> Option<ReadRequest> {
+    if !s.get(1).is_some_and(|m| m.eq_ignore_ascii_case(b"octet")) {
+        return None;
+    }
+    let mut r = ReadRequest {
+        path: firmware_path(name)?,
+        blksize: 512,
+        wsize: 1,
+        rsize: 0,
+        seek: None,
+        timeoutms: None,
+        tsize: false,
+        options: false,
+    };
+    let mut i = 2; // after name and mode: option name/value pairs
+    while i + 1 < s.len() && !s[i].is_empty() {
+        let (k, v) = (s[i], s[i + 1]);
+        r.options = true;
+        match k {
+            b"blksize" => r.blksize = number(v).filter(|&n| (8..=65464).contains(&n))?,
+            b"wsize" => r.wsize = number(v).filter(|&n| (1..=65535).contains(&n))?,
+            b"rsize" => r.rsize = number(v).filter(|&n| n > 0)?,
+            b"seek" => r.seek = Some(number(v)?),
+            b"timeoutms" => r.timeoutms = Some(number(v)? as u32),
+            b"tsize" => r.tsize = true,
+            _ => {}
+        }
+        i += 2;
+    }
+    Some(r)
+}
+
+/// The first packet of a read of a `size`-byte file: an OACK (tqftpserv's order: blksize, timeoutms, tsize,
+/// wsize, rsize, seek) or, without options, block 1.
+pub fn start_read(
+    q: ReadRequest,
+    peer: (u32, u32),
+    port: u32,
+    size: usize,
+    read: &mut ReadFn,
+) -> (Reader, Vec<u8>) {
+    let r = Reader {
+        port,
+        peer,
+        path: q.path,
+        blksize: q.blksize,
+        wsize: q.wsize,
+        rsize: q.rsize,
+        seek: q.seek.unwrap_or(0),
+    };
+    if !q.options {
+        let first = block(&r, 0, read).unwrap_or_else(|_| error(0, "Read error"));
+        return (r, first);
+    }
+    let mut v = OACK.to_be_bytes().to_vec();
+    let mut opt = |k: &str, n: usize| {
+        v.extend_from_slice(k.as_bytes());
+        v.push(0);
+        v.extend_from_slice(alloc::format!("{n}").as_bytes());
+        v.push(0);
+    };
+    opt("blksize", r.blksize);
+    if let Some(t) = q.timeoutms {
+        opt("timeoutms", t as usize);
+    }
+    if q.tsize {
+        opt("tsize", size);
+    }
+    opt("wsize", r.wsize);
+    if r.rsize != 0 {
+        opt("rsize", r.rsize);
+    }
+    if let Some(s) = q.seek {
+        opt("seek", s);
+    }
+    (r, v)
+}
+
+/// DATA block `index + 1`: up to blksize bytes at seek + index * blksize, cut to rsize's remainder in its last block
+fn block(r: &Reader, index: usize, read: &mut ReadFn) -> Result<Vec<u8>, i32> {
+    let mut v = DATA.to_be_bytes().to_vec();
+    v.extend_from_slice(&((index + 1) as u16).to_be_bytes());
+    v.resize(4 + r.blksize, 0);
+    let n = read(&r.path, r.seek + index * r.blksize, &mut v[4..])?;
+    let limit = if (index + 1) * r.blksize > r.rsize {
+        r.rsize % r.blksize
+    } else {
+        0
+    };
+    if limit != 0 && limit > n {
+        return Err(-25); // KErrEof: fewer bytes than the modem asked for (tqftpserv rejects this too)
+    }
+    v.truncate(4 + if limit != 0 { limit } else { n });
+    Ok(v)
+}
+
+/// A packet on a read's port: the DATA blocks to send and whether the read is over. An ACK of block `last` asks
+/// for the next window; the read ends once rsize is covered or on the modem's ERROR (8 = "End of Transfer" after a
+/// size query).
+pub fn reader(r: &Reader, b: &[u8], read: &mut ReadFn) -> (Vec<Vec<u8>>, bool) {
+    let op = match b.get(..4) {
+        Some(o) => u16::from_be_bytes([o[0], o[1]]),
+        None => return (Vec::new(), false),
+    };
+    if op == ERROR {
+        return (Vec::new(), true);
+    }
+    if op != ACK {
+        return (alloc::vec![error(4, "Expected ACK opcode")], true);
+    }
+    let last = u16::from_be_bytes([b[2], b[3]]) as usize;
+    if last * r.blksize > r.rsize {
+        return (Vec::new(), true);
+    }
+    let mut out = Vec::new();
+    for index in last..last + r.wsize {
+        match block(r, index, read) {
+            Ok(d) => out.push(d),
+            Err(_) => {
+                out.push(error(0, "Read error"));
+                return (out, true);
+            }
+        }
+        if (index + 1) * r.blksize > r.rsize {
+            break;
+        }
+    }
+    (out, false)
 }
 
 pub fn error(code: u16, msg: &str) -> Vec<u8> {
@@ -64,7 +264,10 @@ pub fn request(b: &[u8], from: (u32, u32), port: u32) -> Action {
     let s = strings(&b[2..]);
     let name = String::from_utf8_lossy(s.first().copied().unwrap_or(&[])).into_owned();
     match op {
-        RRQ => Action::Reply(error(1, "File not found")),
+        RRQ => match read_request(&name, &s) {
+            Some(q) => Action::Read(q),
+            None => Action::Reply(error(1, "File not found")),
+        },
         WRQ => {
             let mut blksize = 512;
             let mut oack = Vec::new();
@@ -145,6 +348,117 @@ mod tests {
             v.push(0);
         }
         v
+    }
+
+    fn rrq(name: &str, opts: &[(&str, &str)]) -> Vec<u8> {
+        let mut v = RRQ.to_be_bytes().to_vec();
+        for s in [name, "octet"]
+            .iter()
+            .chain(opts.iter().flat_map(|(k, v)| [k, v]))
+        {
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+        }
+        v
+    }
+
+    /// a 20000-byte file whose byte i is i % 251
+    fn file(_: &str, at: usize, buf: &mut [u8]) -> Result<usize, i32> {
+        let n = buf.len().min(20000usize.saturating_sub(at));
+        for (i, b) in buf[..n].iter_mut().enumerate() {
+            *b = ((at + i) % 251) as u8;
+        }
+        Ok(n)
+    }
+
+    fn start(opts: &[(&str, &str)]) -> (Reader, Vec<u8>) {
+        let Action::Read(q) = request(
+            &rrq("/readonly/firmware/image/wlanmdsp.mbn", opts),
+            (0, 65),
+            0x100,
+        ) else {
+            panic!("not a read");
+        };
+        assert_eq!(q.path, "IMAGE/WLANMDSP.MBN");
+        start_read(q, (0, 65), 0x100, 20000, &mut file)
+    }
+
+    #[test]
+    fn size_query_like_the_modem() {
+        // C1 trace: blksize 7680, timeoutms 200, tsize 0, wsize 10 -> OACK with the size; the modem then ends it
+        let opts = [
+            ("blksize", "7680"),
+            ("timeoutms", "200"),
+            ("tsize", "0"),
+            ("wsize", "10"),
+        ];
+        let (r, oack) = start(&opts);
+        assert_eq!(
+            oack,
+            b"\x00\x06blksize\x007680\x00timeoutms\x00200\x00tsize\x0020000\x00wsize\x0010\x00"
+                .to_vec()
+        );
+        let mut end = ERROR.to_be_bytes().to_vec();
+        end.extend_from_slice(&8u16.to_be_bytes());
+        end.extend_from_slice(b"End of Transfer\0");
+        assert_eq!(reader(&r, &end, &mut file), (Vec::new(), true));
+    }
+
+    #[test]
+    fn rsize_seek_window() {
+        // 10000 bytes from 3000 in 4096-byte blocks, 2 per window: 4096 + 4096, then 1808, then done
+        let opts = [
+            ("blksize", "4096"),
+            ("wsize", "2"),
+            ("rsize", "10000"),
+            ("seek", "3000"),
+        ];
+        let (r, oack) = start(&opts);
+        assert!(oack.ends_with(b"wsize\x002\x00rsize\x0010000\x00seek\x003000\x00"));
+        let (w, done) = reader(&r, &ack(0), &mut file);
+        assert!(!done);
+        assert_eq!(w.len(), 2);
+        assert_eq!(&w[0][..4], &[0, 3, 0, 1]);
+        assert_eq!(w[0].len(), 4 + 4096);
+        assert_eq!(w[0][4], (3000 % 251) as u8);
+        assert_eq!(&w[1][..4], &[0, 3, 0, 2]);
+        assert_eq!(w[1][4], ((3000 + 4096) % 251) as u8);
+        let (w, done) = reader(&r, &ack(2), &mut file);
+        assert!(!done);
+        assert_eq!(w.len(), 1);
+        assert_eq!(&w[0][..4], &[0, 3, 0, 3]);
+        assert_eq!(w[0].len(), 4 + 10000 - 8192);
+        assert_eq!(reader(&r, &ack(3), &mut file), (Vec::new(), true));
+    }
+
+    #[test]
+    fn vendor_firmware_files() {
+        assert_eq!(
+            firmware_path("/readonly/vendor/firmware/wlanmdsp.mbn").as_deref(),
+            Some("vendor/firmware/wlanmdsp.mbn")
+        );
+        for bad in [
+            "/readonly/vendor/firmware/../build.prop",
+            "/readonly/vendor/firmware/a/b",
+            "/readonly/vendor/firmware/",
+        ] {
+            assert_eq!(firmware_path(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_firmware_image_files() {
+        for bad in [
+            "/readonly/vendor/mbn/mcfg_hw/mbn_hw.dig",
+            "/readonly/firmware/image/../x.mbn",
+            "/readonly/firmware/image/sub/x.mbn",
+            "/readonly/firmware/image/toolongname.mbn",
+        ] {
+            assert!(
+                matches!(request(&rrq(bad, &[]), (0, 1), 0x100), Action::Reply(_)),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
