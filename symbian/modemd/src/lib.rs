@@ -438,7 +438,10 @@ impl Daemon {
             m.lost();
         }
         if self.modem.is_some() && self.recovery_attempt < 3 {
-            self.recover(3);
+            // a modem failure restarts the modem only while the ADSP is healthy and quiet (as for a FATAL): stopping
+            // a healthy ADSP once never returned and froze the phone (2026-11-12, after a failed modem reboot)
+            let mask = recovery::recovery_mask(adsp::processor_state(), self.audio.apr.quiescent());
+            self.recover(mask);
         }
     }
 

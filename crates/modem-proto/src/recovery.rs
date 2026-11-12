@@ -112,4 +112,12 @@ mod tests {
         assert!(!rising(&mut latch, false));
         assert!(rising(&mut latch, true));
     }
+
+    #[test]
+    fn a_healthy_quiet_adsp_is_kept_for_a_modem_failure() {
+        // the ADSP state the phone reported when the modem crashed after a call (2026-11-12)
+        assert_eq!(recovery_mask(Ok([4, 0, 6, 3]), true), 1);
+        assert_eq!(recovery_mask(Ok([4, 0, 6, 3]), false), 3); // audio still running: both restart
+        assert_eq!(recovery_mask(Err(-5), true), 3);
+    }
 }
