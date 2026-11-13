@@ -167,6 +167,8 @@ pub struct Modem {
     ssctl_txn: u16,
     online_sent: bool,
     plmn_asked: Option<(u16, u16)>,
+    /// Get Network Time was sent (once registered): the indication may have come before we subscribed
+    time_asked: bool,
     hangup_pending: bool,
     /// the call watchdog: the (id, state) tick last saw, since when (ms), and when END was last tried
     call_seen: (u8, u8),
@@ -267,6 +269,7 @@ impl Modem {
             ssctl_txn: 0,
             online_sent: false,
             plmn_asked: None,
+            time_asked: false,
             hangup_pending: false,
             call_seen: (0, 0),
             call_since: 0,
@@ -1415,6 +1418,7 @@ impl Modem {
                 "nas: mode preference {:#x}",
                 nas::mode_preference(m).unwrap_or(0)
             )),
+            (NAS, nas::GET_NETWORK_TIME) => self.network_time(p, m),
             (NAS, nas::GET_PLMN_NAME) => {
                 if let Some(n) = nas::plmn_name(m) {
                     p.log(format_args!("nas: operator {n}"));
@@ -1441,6 +1445,7 @@ impl Modem {
         match (service, m.id) {
             (NAS, nas::GET_SERVING_SYSTEM) => self.serving(p, m),
             (NAS, nas::SIGNAL_INFO_IND) => self.signal(m),
+            (NAS, nas::NETWORK_TIME_IND) => self.network_time(p, m),
             (UIM, uim::STATUS_IND) => self.card_status(p, m),
             (VOICE, voice::ALL_CALL_STATUS_IND) => {
                 let Some(calls) = voice::all_calls(m) else {
@@ -1573,6 +1578,11 @@ impl Modem {
                 self.request(p, NAS, nas::SET_SYSTEM_SELECTION, &nas::VOICE_ONLY);
                 self.request(p, NAS, nas::GET_SYSTEM_SELECTION, &[]);
             }
+            // the network's time (NITZ) once: its indication may have come before we subscribed
+            if !self.time_asked {
+                self.time_asked = true;
+                self.request(p, NAS, nas::GET_NETWORK_TIME, &[]);
+            }
         }
         if !registered {
             self.status.bars = 0;
@@ -1589,6 +1599,24 @@ impl Modem {
             q[2..].copy_from_slice(&mnc.to_le_bytes());
             self.request(p, NAS, nas::GET_PLMN_NAME, &[(0x01, &q)]);
         }
+    }
+
+    /// The network's time (NITZ) for the phone's automatic time: a new value each time the network sends one.
+    fn network_time(&mut self, p: &mut dyn Platform, m: &qmi::Msg) {
+        let Some(t) = nas::network_time(m) else {
+            p.log(format_args!("nas: no network time in {:#x}", m.id));
+            return;
+        };
+        p.log(format_args!(
+            "nas: network time {} UTC, zone {} quarter hours, dst {}",
+            t.utc, t.tz, t.dst
+        ));
+        self.status.nitz = modem_ipc::Nitz {
+            utc: t.utc,
+            tz: t.tz,
+            dst: t.dst,
+            seq: self.status.nitz.seq.wrapping_add(1),
+        };
     }
 
     fn signal(&mut self, m: &qmi::Msg) {
@@ -2257,9 +2285,9 @@ mod tests {
             (m.status.reg, m.status.rat),
             (modem_ipc::reg::HOME, modem_ipc::rat::LTE)
         );
-        // registered: voice-only (once), then the name
+        // registered: voice-only (once), the network time (once), then the name
         let n = f.sent.len();
-        let sel = &f.sent[n - 3];
+        let sel = &f.sent[n - 4];
         assert_eq!(req(sel).2, nas::SET_SYSTEM_SELECTION);
         let (_, pay) = qrtr::decode(sel).unwrap();
         let sel = qmi::Msg::parse(pay).unwrap();
@@ -2267,7 +2295,8 @@ mod tests {
             (sel.tlv(0x11), sel.tlv(0x18), sel.tlv(0x17)),
             (Some(&[0x0c, 0][..]), Some(&[0u8; 4][..]), Some(&[0u8][..]))
         );
-        assert_eq!(req(&f.sent[n - 2]).2, nas::GET_SYSTEM_SELECTION);
+        assert_eq!(req(&f.sent[n - 3]).2, nas::GET_SYSTEM_SELECTION);
+        assert_eq!(req(&f.sent[n - 2]).2, nas::GET_NETWORK_TIME);
         let (_, _, id, txn) = req(f.sent.last().unwrap());
         assert_eq!(id, nas::GET_PLMN_NAME);
         let mut t = alloc::vec![0, 0, 0, 0, 0, 4];
@@ -2605,6 +2634,7 @@ mod tests {
     fn final_end_observes_actual_lte_once_per_second_without_radio_changes() {
         let (mut m, mut f) = (modem(), fake());
         m.ipa_up = true;
+        m.time_asked = true; // only the serving-system reads are counted below
         m.handle(&mut f, &ns(NAS, 51));
         m.handle(&mut f, &ns(VOICE, 77));
         m.tick(&mut f, 1000);

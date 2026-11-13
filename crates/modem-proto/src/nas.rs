@@ -14,9 +14,64 @@ pub const SET_SYSTEM_SELECTION: u16 = 0x33;
 pub const GET_SYSTEM_SELECTION: u16 = 0x34;
 pub const GET_SIGNAL_INFO: u16 = 0x4f;
 pub const SIGNAL_INFO_IND: u16 = 0x51;
+pub const NETWORK_TIME_IND: u16 = 0x4c;
+pub const GET_NETWORK_TIME: u16 = 0x7d;
 
-/// Register Indications: serving system (0x13) and signal info (0x19) on.
-pub const INDICATIONS: [(u8, &[u8]); 2] = [(0x13, &[1]), (0x19, &[1])];
+/// Register Indications: serving system (0x13), network time (0x17) and signal info (0x19) on.
+pub const INDICATIONS: [(u8, &[u8]); 3] = [(0x13, &[1]), (0x17, &[1]), (0x19, &[1])];
+
+/// The network's time (NITZ): UTC as Unix seconds, the zone in quarter hours (daylight saving included) and the
+/// daylight saving hours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkTime {
+    pub utc: u32,
+    pub tz: i8,
+    pub dst: u8,
+}
+
+/// Days since 1970-01-01 of a Gregorian date (H. Hinnant's days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468
+}
+
+/// The universal time sequence {u16 year, month, day, hour, minute, second, day of week} as Unix seconds.
+fn universal_time(t: &[u8]) -> Option<u32> {
+    let year = i64::from(u16::from_le_bytes([*t.first()?, *t.get(1)?]));
+    let [mo, d, h, mi, s] = [2, 3, 4, 5, 6].map(|i| t.get(i).map_or(99, |&b| i64::from(b)));
+    if year < 2000
+        || !(1..=12).contains(&mo)
+        || !(1..=31).contains(&d)
+        || h > 23
+        || mi > 59
+        || s > 60
+    {
+        return None;
+    }
+    u32::try_from(days_from_civil(year, mo, d) * 86_400 + h * 3600 + mi * 60 + s).ok()
+}
+
+/// Network Time indication (0x4C): TLV 0x01 universal time, 0x10 zone, 0x11 daylight saving. Get Network Time
+/// (0x7D): TLV 0x11 the 3GPP time, else 0x10 the 3GPP2 one, each {universal time, zone, daylight saving, radio}
+/// (libqmi `qmi-service-nas.json`).
+pub fn network_time(m: &Msg) -> Option<NetworkTime> {
+    if m.id == NETWORK_TIME_IND {
+        return Some(NetworkTime {
+            utc: universal_time(m.tlv(0x01)?)?,
+            tz: m.u8(0x10).map_or(0, |b| b as i8),
+            dst: m.u8(0x11).unwrap_or(0),
+        });
+    }
+    let t = m.tlv(0x11).or_else(|| m.tlv(0x10))?;
+    Some(NetworkTime {
+        utc: universal_time(t.get(..8)?)?,
+        tz: *t.get(8)? as i8,
+        dst: *t.get(9)?,
+    })
+}
 
 /// Set System Selection Preference for voice only: mode preference (0x11) GSM | UMTS, service domain (0x18) CS only,
 /// change duration (0x17) until power cycle, so nothing is persisted in the modem's NV (libqmi layouts).
@@ -134,6 +189,42 @@ fn ascii(b: &[u8]) -> Option<alloc::string::String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_time_indication_and_response() {
+        // 12 Nov 2026 19:50:07 UTC, a Thursday (day of week 3), +4 h = 16 quarter hours (Yerevan)
+        let t = [0xea, 0x07, 11, 12, 19, 50, 7, 3];
+        let ind = Builder::new(INDICATION, 1, NETWORK_TIME_IND)
+            .tlv(0x01, &t)
+            .u8(0x10, 16)
+            .u8(0x11, 0)
+            .tlv(0x12, &[8])
+            .finish();
+        let want = NetworkTime {
+            utc: 1_794_513_007,
+            tz: 16,
+            dst: 0,
+        };
+        assert_eq!(network_time(&Msg::parse(&ind).unwrap()), Some(want));
+        // Get Network Time: the 3GPP sequence {time, zone, dst, radio}; a negative zone (UTC-3:30)
+        let mut seq = t.to_vec();
+        seq.extend_from_slice(&[(-14i8) as u8, 1, 8]);
+        let rsp = Builder::new(RESPONSE, 2, GET_NETWORK_TIME)
+            .result(0)
+            .tlv(0x11, &seq)
+            .finish();
+        let got = network_time(&Msg::parse(&rsp).unwrap()).unwrap();
+        assert_eq!((got.utc, got.tz, got.dst), (1_794_513_007, -14, 1));
+        // nothing usable: no time TLV, a bad month
+        let none = Builder::new(RESPONSE, 3, GET_NETWORK_TIME)
+            .result(0)
+            .finish();
+        assert_eq!(network_time(&Msg::parse(&none).unwrap()), None);
+        let bad = Builder::new(INDICATION, 4, NETWORK_TIME_IND)
+            .tlv(0x01, &[0xea, 0x07, 13, 12, 19, 50, 7, 3])
+            .finish();
+        assert_eq!(network_time(&Msg::parse(&bad).unwrap()), None);
+    }
     use crate::qmi::{Builder, INDICATION, RESPONSE};
 
     fn msg(b: &[u8]) -> Msg<'_> {

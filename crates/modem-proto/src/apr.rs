@@ -1341,8 +1341,10 @@ mod tests {
         let b = ring_pcm(10);
         assert_eq!(b.len(), RING_BYTES);
         assert!(
-            b.chunks_exact(2)
-                .map(|s| i16::from_le_bytes(s.try_into().unwrap()))
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|s| i16::from_le_bytes(*s))
                 .all(|s| s.abs() <= 12_000)
         );
     }

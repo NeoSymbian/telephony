@@ -179,6 +179,19 @@ pub struct Audio {
     pub volume: u8,
 }
 
+/// The network's time (NITZ: QMI NAS Network Time), for the phone's automatic time.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Nitz {
+    /// UTC as Unix seconds when the network sent it; 0 = none yet
+    pub utc: u32,
+    /// the local zone in quarter hours east of UTC, daylight saving included (3GPP TS 24.008)
+    pub tz: i8,
+    /// the daylight saving part of `tz`, in hours
+    pub dst: u8,
+    /// counts the network times received: a new one is a new value even if `utc` didn't move
+    pub seq: u16,
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Status {
     pub modem: u8,
@@ -203,6 +216,7 @@ pub struct Status {
     pub pin_attempts: u8,
     pub ring: Ring,
     pub missed: u32,
+    pub nitz: Nitz,
 }
 
 impl Status {
@@ -245,6 +259,10 @@ impl Status {
             self.calls.len,
         ]);
         b[98..102].copy_from_slice(&self.missed.to_le_bytes());
+        b[102..106].copy_from_slice(&self.nitz.utc.to_le_bytes());
+        b[106] = self.nitz.tz as u8;
+        b[107] = self.nitz.dst;
+        b[108..110].copy_from_slice(&self.nitz.seq.to_le_bytes());
         for (i, c) in self.calls.as_slice().iter().enumerate() {
             let at = 110 + i * 36;
             b[at..at + 4].copy_from_slice(&[c.id, c.state, c.incoming as u8, c.number.len]);
@@ -311,6 +329,12 @@ impl Status {
             },
             calls,
             missed: u32::from_le_bytes(b[98..102].try_into().ok()?),
+            nitz: Nitz {
+                utc: u32::from_le_bytes(b[102..106].try_into().ok()?),
+                tz: b[106] as i8,
+                dst: b[107],
+                seq: u16::from_le_bytes(b[108..110].try_into().ok()?),
+            },
         })
     }
 }
@@ -364,6 +388,12 @@ mod tests {
             airplane: true,
             pin_attempts: 2,
             missed: 7,
+            nitz: Nitz {
+                utc: 1_794_513_007,
+                tz: -14,
+                dst: 1,
+                seq: 3,
+            },
             ..Default::default()
         };
         s.calls.len = 2;
