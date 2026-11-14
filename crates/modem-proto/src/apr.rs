@@ -25,6 +25,10 @@ const ASM_OPEN: u32 = 0x10db3;
 const ASM_FMT: u32 = 0x10d98;
 const ASM_RUN: u32 = 0x10daa;
 const ASM_WRITE: u32 = 0x10dab;
+/// The upper word of every ASM buffer address: the ADSP picks the apps-SMMU stream of its DMA from it. Linux's
+/// q6asm-dai sends `phys | sid << 32` with sid = the DTB's `iommus` stream 0x1801 & 0xf; with 0 the ADSP read through
+/// stream 0x1800 and the ringtone's first write froze the whole phone (2026-11-14). The kernel maps 0x1801 (AudioMem).
+pub const ASM_SID: u32 = 1;
 const ASM_WRITTEN: u32 = 0x10d99;
 const ASM_PAUSE: u32 = 0x10bd3;
 const ASM_CLOSE: u32 = 0x10bcd;
@@ -33,25 +37,70 @@ const ADM_OPEN_RSP: u32 = 0x10329;
 const ADM_CLOSE: u32 = 0x10327;
 const ADM_ROUTE: u32 = 0x10325;
 const RING_PORT: u16 = 0x0101;
-pub const RING_BYTES: usize = 48_000;
+/// The ringtone loop: 2 s of 48 kHz mono PCM16. The kernel's AudioMem region holds [`RING_REGION`] bytes.
+pub const RING_BYTES: usize = 192_000;
+/// The ASM-mapped region (the kernel's KAudioBytes).
+pub const RING_REGION: u32 = 0x40000;
 
-/// Original two-pulse triangle ringtone: 48kHz signed mono PCM16, half a second.
-/// PCM level carries ring volume so voice volume remains untouched.
+const RATE: f32 = 48_000.0;
+
+/// Original ringtone (NeoSymbian's own): a soft bell arpeggio, E major up and back, then a breath of quiet; 48 kHz
+/// signed mono PCM16, 2 s, looped by the writes. Each note is a sine with a little of its octave and twelfth, a 4 ms
+/// attack and an exponential decay; overlapping tails ring into each other. `volume` 0..=10 scales the PCM, so the
+/// voice volume stays untouched.
 pub fn ring_pcm(volume: u8) -> Vec<u8> {
+    // (start s, Hz): E5 G#5 B5 E6, then B5 G#5 softly
+    const NOTES: [(f32, f32, f32); 6] = [
+        (0.00, 659.26, 1.0),
+        (0.16, 830.61, 0.9),
+        (0.32, 987.77, 0.85),
+        (0.48, 1318.51, 0.8),
+        (0.80, 987.77, 0.55),
+        (0.96, 830.61, 0.45),
+    ];
+    let n = RING_BYTES / 2;
+    let mut mix = alloc::vec![0f32; n];
+    for &(start, hz, level) in &NOTES {
+        for (harmonic, part) in [(1.0f32, 1.0f32), (2.0, 0.22), (3.0, 0.07)] {
+            let w = 2.0 * core::f32::consts::PI * hz * harmonic / RATE;
+            // sin(n w) by the recurrence s[n] = 2 cos(w) s[n-1] - s[n-2]; cos from its series (w < 0.6)
+            let w2 = w * w;
+            let k = 2.0 * (1.0 - w2 / 2.0 + w2 * w2 / 24.0 - w2 * w2 * w2 / 720.0);
+            let (mut s1, mut s2) = (0.0f32, -sin_small(w));
+            let first = (start * RATE) as usize;
+            // decay: higher partials die sooner, like a struck bar
+            let decay = 1.0 - 1.0 / (RATE * 0.32 / harmonic);
+            let mut env = level * part;
+            for (i, out) in mix.iter_mut().enumerate().skip(first) {
+                let s0 = k * s1 - s2;
+                s2 = s1;
+                s1 = s0;
+                let attack = ((i - first) as f32 / (0.004 * RATE)).min(1.0);
+                *out += s0 * env * attack;
+                env *= decay;
+                if env < 1e-4 {
+                    break;
+                }
+            }
+        }
+    }
+    // a 20 ms fade at the loop's end so the repeat never clicks
+    let fade = (0.02 * RATE) as usize;
+    let peak = 11_000.0 * f32::from(volume.min(10)) / 10.0;
     let mut b = Vec::with_capacity(RING_BYTES);
-    for i in 0..RING_BYTES / 2 {
-        let within = i % 12_000;
-        let env = if within < 7200 {
-            within.min(7200 - within).min(480) as i32
-        } else {
-            0
-        };
-        let phase = (i % 80) as i32;
-        let triangle = if phase < 40 { phase - 20 } else { 60 - phase };
-        let sample = (triangle * 600 * env * i32::from(volume.min(10)) / 480 / 10) as i16;
-        b.extend_from_slice(&sample.to_le_bytes());
+    for (i, v) in mix.iter().enumerate() {
+        let tail = ((n - i) as f32 / fade as f32).min(1.0);
+        // the arpeggio's overlaps reach about 1.6: keep the sum under `peak`
+        let x = (v / 1.7).clamp(-1.0, 1.0) * peak * tail;
+        b.extend_from_slice(&(x as i16).to_le_bytes());
     }
     b
+}
+
+/// sin(x) for |x| < 1 (Taylor to x^7).
+fn sin_small(x: f32) -> f32 {
+    let x2 = x * x;
+    x * (1.0 - x2 / 6.0 * (1.0 - x2 / 20.0 * (1.0 - x2 / 42.0)))
 }
 pub const SVC_MVM: u8 = 9;
 pub const SVC_CVP: u8 = 0x0b;
@@ -602,7 +651,7 @@ impl Audio {
                 let mut v = Vec::new();
                 v.extend_from_slice(&3u16.to_le_bytes());
                 v.extend_from_slice(&1u16.to_le_bytes());
-                for w in [0, self.pcm_phys, 0, 65_536] {
+                for w in [0, self.pcm_phys, ASM_SID, RING_REGION] {
                     v.extend_from_slice(&w.to_le_bytes());
                 }
                 packet(SVC_ASM, 0, 0, 0x100, ASM_MAP, &v)
@@ -655,7 +704,7 @@ impl Audio {
                 let mut v = Vec::new();
                 for w in [
                     self.pcm_phys,
-                    0,
+                    ASM_SID,
                     self.map_handle,
                     RING_BYTES as u32,
                     self.ticket,
@@ -856,7 +905,7 @@ impl Audio {
                     .payload
                     .get(4..8)
                     .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
-                if addr != Some(self.pcm_phys) || high != Some(0) {
+                if addr != Some(self.pcm_phys) || high != Some(ASM_SID) {
                     self.failed(log);
                     return;
                 }
@@ -1230,7 +1279,7 @@ mod tests {
             ),
             ASM_WRITE => {
                 let mut payload = Vec::new();
-                for w in [a.pcm_phys, 0, a.map_handle, 0] {
+                for w in [a.pcm_phys, ASM_SID, a.map_handle, 0] {
                     payload.extend_from_slice(&w.to_le_bytes());
                 }
                 packet(SVC_ASM, RING_PORT, RING_PORT, token, ASM_WRITTEN, &payload)
@@ -1347,6 +1396,21 @@ mod tests {
                 .map(|s| i16::from_le_bytes(*s))
                 .all(|s| s.abs() <= 12_000)
         );
+        let pcm: Vec<i16> = b
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| i16::from_le_bytes(*s))
+            .collect();
+        // loud enough to hear, clickless at both ends of the loop
+        assert!(pcm.iter().map(|s| s.abs()).max().unwrap() > 6_000);
+        assert!(pcm[0].abs() < 200 && pcm[RING_BYTES / 2 - 1].abs() < 200);
+        // the first note is E5: about 2 * 659 zero crossings a second (in its first 0.1 s, before G#5)
+        let crossings = pcm[..4_800]
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
+        assert!((120..=145).contains(&crossings), "{crossings}");
     }
     #[test]
     fn off_during_teardown_does_not_permit_modem_only_recovery() {
