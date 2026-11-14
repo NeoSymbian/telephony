@@ -15,6 +15,7 @@ name = "modem-proto"
 version = "0.1.0"
 dependencies = [
  "modem-ipc",
+ "phone-rules",
  "wlfw",
 ]
 

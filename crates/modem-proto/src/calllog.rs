@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The call log (docs/telephony.md C8): MODEMD watches every call of the All Call Status indications and records each
-//! one when it ends, as dialled, received (answered), missed or rejected (hung up while it rang). MODEMD keeps it in
-//! `C:\private\e0003001\calls.db` ([`CallLog::encode`]); clients read it with modem_ipc::op::CALL_LOG.
+//! one when it ends, as dialled, received (answered), missed, rejected (hung up while it rang) or blocked (rejected by
+//! the blocklist before it rang). MODEMD keeps it in `C:\private\e0003001\calls.db` ([`CallLog::encode`]); clients
+//! read it with modem_ipc::op::CALL_LOG.
 
 use alloc::vec::Vec;
 use modem_ipc::{Call, LogEntry, MAX_LOG, Text, call, log};
 
-const MAGIC: &[u8; 4] = b"NCL1";
+const MAGIC: &[u8; 4] = b"NCL2";
+/// v2.1 files: 51-byte entries without `why`.
+const MAGIC_V1: &[u8; 4] = b"NCL1";
 const DAY_MS: i64 = 86_400_000;
+/// Blocked calls are kept at most this many days.
+const BLOCKED_DAYS: u8 = 7;
 
 /// A call in progress.
 #[derive(Clone, Copy, Debug)]
@@ -17,6 +22,8 @@ struct Live {
     connected_ms: Option<u64>,
     incoming: bool,
     rejected: bool,
+    /// phone_rules::block::why, 0 = not blocked
+    blocked: u8,
     number: Text,
     presentation: u8,
 }
@@ -66,6 +73,7 @@ impl CallLog {
                     connected_ms: (c.state == call::CONVERSATION).then_some(now_ms),
                     incoming: c.incoming,
                     rejected: false,
+                    blocked: 0,
                     number: c.number,
                     presentation: c.presentation,
                 }),
@@ -95,6 +103,19 @@ impl CallLog {
         }
     }
 
+    /// MODEMD rejected call `id` because the blocklist matched (`why`): logged as blocked, never missed.
+    pub fn blocked(&mut self, id: u8, why: u8) {
+        if let Some(l) = self.live.iter_mut().find(|l| l.id == id && l.incoming) {
+            l.rejected = true;
+            l.blocked = why.max(1);
+        }
+    }
+
+    /// Call `id` was blocked.
+    pub fn is_blocked(&self, id: u8) -> bool {
+        self.live.iter().any(|l| l.id == id && l.blocked != 0)
+    }
+
     /// Call `id` is ringing and the user rejected it (not a missed call).
     pub fn is_rejected(&self, id: u8) -> bool {
         self.live.iter().any(|l| l.id == id && l.rejected)
@@ -105,6 +126,7 @@ impl CallLog {
             return false;
         }
         let kind = match (l.incoming, l.connected_ms, l.rejected) {
+            _ if l.blocked != 0 => log::BLOCKED,
             (false, _, _) => log::DIALLED,
             (true, Some(_), _) => log::RECEIVED,
             (true, None, true) => log::REJECTED,
@@ -122,6 +144,7 @@ impl CallLog {
                 kind,
                 presentation: l.presentation,
                 number: l.number,
+                why: l.blocked,
             },
         );
         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -133,8 +156,11 @@ impl CallLog {
     fn prune(&mut self, utc_ms: i64) {
         let before = self.entries.len();
         if utc_ms > 0 {
-            let oldest = utc_ms - i64::from(self.days) * DAY_MS;
-            self.entries.retain(|e| e.utc == 0 || e.utc >= oldest);
+            let oldest = |days: u8| utc_ms - i64::from(days) * DAY_MS;
+            let (all, blocked) = (oldest(self.days), oldest(self.days.min(BLOCKED_DAYS)));
+            self.entries.retain(|e| {
+                e.utc == 0 || e.utc >= if e.kind == log::BLOCKED { blocked } else { all }
+            });
         }
         self.entries.truncate(MAX_LOG);
         self.dirty |= self.entries.len() != before;
@@ -173,7 +199,7 @@ impl CallLog {
         b
     }
 
-    /// `calls.db`: "NCL1", next id (u32), days, count, then the entries.
+    /// `calls.db`: "NCL2", next id (u32), days, count, then the entries.
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::with_capacity(10 + self.entries.len() * LogEntry::SIZE);
         b.extend_from_slice(MAGIC);
@@ -184,16 +210,22 @@ impl CallLog {
         b
     }
 
-    /// A saved log; `None` for a file that isn't one (MODEMD then starts empty).
+    /// A saved log ("NCL2", or the v2.1 "NCL1"); `None` for a file that isn't one (MODEMD then starts empty).
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.get(..4)? != MAGIC {
-            return None;
-        }
+        let size = match b.get(..4)? {
+            m if m == MAGIC => LogEntry::SIZE,
+            m if m == MAGIC_V1 => LogEntry::SIZE - 1,
+            _ => return None,
+        };
         let next_id = u32::from_le_bytes(b.get(4..8)?.try_into().ok()?).max(1);
         let days = *b.get(8)?;
         let n = usize::from(*b.get(9)?).min(MAX_LOG);
         let entries = (0..n)
-            .map(|i| LogEntry::from_bytes(b.get(10 + i * LogEntry::SIZE..)?))
+            .map(|i| {
+                let mut e = [0u8; LogEntry::SIZE];
+                e[..size].copy_from_slice(b.get(10 + i * size..10 + (i + 1) * size)?);
+                LogEntry::from_bytes(&e)
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(Self {
             entries,
@@ -307,6 +339,12 @@ mod tests {
             (l.entries.clone(), 71, 30)
         );
         assert!(CallLog::decode(b"NCL0").is_none());
+        // a v2.1 file: 51-byte entries
+        let mut v1 = Vec::from(&b"NCL1"[..]);
+        v1.extend_from_slice(&[5, 0, 0, 0, 30, 1]);
+        v1.extend_from_slice(&l.entries[0].to_bytes()[..LogEntry::SIZE - 1]);
+        let old = CallLog::decode(&v1).unwrap();
+        assert_eq!((old.entries[0], old.next_id), (l.entries[0], 5));
         assert_eq!(l.to_wire(3 * LogEntry::SIZE + 7).len(), 3 * LogEntry::SIZE);
 
         assert!(l.clear(70, 0));
@@ -318,5 +356,24 @@ mod tests {
         l.observe(&[c(1, call::INCOMING, true, "+1")], 0, T0);
         assert!(l.set_days(0, T0));
         assert!(!l.observe(&[], 0, T0), "no log: nothing recorded");
+    }
+
+    #[test]
+    fn blocked_is_logged_with_why_and_kept_a_week() {
+        let mut l = CallLog::default();
+        l.observe(&[c(1, call::INCOMING, true, "+19005550101")], 0, T0);
+        l.blocked(1, 2);
+        assert!(l.is_blocked(1) && l.is_rejected(1));
+        l.observe(&[c(1, call::END, true, "+19005550101")], 500, T0);
+        l.observe(&[c(2, call::INCOMING, true, "+2")], 600, T0);
+        l.observe(&[], 700, T0);
+        let e = l.entries[1];
+        assert_eq!((e.kind, e.why, e.duration_s), (log::BLOCKED, 2, 0));
+        assert_eq!(l.entries[0].kind, log::MISSED);
+        // eight days later the blocked call is gone, the missed one (30-day log) stays
+        l.observe(&[c(3, call::INCOMING, true, "+3")], 800, T0 + 8 * DAY_MS);
+        l.observe(&[], 900, T0 + 8 * DAY_MS);
+        let kinds: Vec<u8> = l.entries.iter().map(|e| e.kind).collect();
+        assert_eq!(kinds, [log::MISSED, log::MISSED]);
     }
 }

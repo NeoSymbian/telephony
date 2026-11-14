@@ -4,11 +4,13 @@
 //! - [`dial`]: what a typed string is (number, service code, USSD, ...), SPS §5-§6;
 //! - [`emergency`]: the emergency numbers, SPS §8;
 //! - [`number`]: whether two phone numbers are the same subscriber (caller names), SPS §13;
-//! - [`caller`]: the caller line of the call screens and the log, SPS §3.
+//! - [`caller`]: the caller line of the call screens and the log, SPS §3;
+//! - [`block`]: the blocklist MODEMD applies to incoming calls.
 #![no_std]
 
 extern crate alloc;
 
+pub mod block;
 pub mod caller;
 pub mod dial;
 pub mod emergency;

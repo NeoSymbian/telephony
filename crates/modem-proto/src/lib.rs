@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+pub use phone_rules;
+
 pub mod apr;
 pub mod calllog;
 pub mod ipa;
@@ -204,6 +206,8 @@ pub struct Modem {
     waiting_request: i32,
     /// a call being rejected as busy (UDUB); END follows if the modem refuses it
     rejecting: Option<u8>,
+    /// Incoming calls rejected before they ring (modem_ipc::op::BLOCK_SET, KNOWN_SET); MODEMD keeps it in block.db.
+    pub block: phone_rules::block::List,
     response_seen: bool,
     heartbeat_at: u64,
 }
@@ -304,6 +308,7 @@ impl Modem {
             clir: modem_ipc::clir::NETWORK,
             waiting_request: 0,
             rejecting: None,
+            block: phone_rules::block::List::default(),
             response_seen: false,
             heartbeat_at: 0,
             ipa_up: false,
@@ -728,6 +733,33 @@ impl Modem {
         self.user_request(p, VOICE, voice::END, &[(1, &[c.id])])
     }
 
+    /// Reject each new incoming or waiting call the blocklist matches as busy (UDUB, END if refused), before it
+    /// rings. A call whose number hasn't arrived yet (shown, but not in this indication) is decided on a later one.
+    fn block_calls(&mut self, p: &mut dyn Platform, calls: &modem_ipc::Calls) {
+        use phone_rules::caller::presentation;
+        for c in calls.as_slice() {
+            let ringing = c.incoming && matches!(c.state, call::INCOMING | call::WAITING);
+            let known = !c.number.as_str().is_empty()
+                || matches!(
+                    c.presentation,
+                    presentation::RESTRICTED | presentation::UNAVAILABLE
+                );
+            if !ringing || !known || self.log.is_blocked(c.id) || self.answered.contains(&c.id) {
+                continue;
+            }
+            let Some(why) = self.block.check_call(c.number.as_str(), c.presentation) else {
+                continue;
+            };
+            p.log(format_args!("voice: call {} blocked (rule {why})", c.id));
+            self.log.blocked(c.id, why);
+            if self.request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[1])]) {
+                self.rejecting = Some(c.id);
+            } else {
+                self.request(p, VOICE, voice::END, &[(1, &[c.id])]);
+            }
+        }
+    }
+
     pub fn manage(&mut self, p: &mut dyn Platform, action: i32, id: u8) -> Result<(), i32> {
         use modem_ipc::manage;
         let c = self.target(id).ok_or(KERR_NOT_READY)?;
@@ -763,7 +795,13 @@ impl Modem {
             manage::MERGE if active && held => {
                 self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[5])])
             }
-            manage::HOLD | manage::RESUME | manage::SWAP | manage::MERGE => Err(KERR_NOT_READY),
+            // type 2 = release the active calls and accept the held or waiting one (3GPP 22.030 CHLD=1)
+            manage::END_ANSWER if active && waiting => {
+                self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[2])])
+            }
+            manage::HOLD | manage::RESUME | manage::SWAP | manage::MERGE | manage::END_ANSWER => {
+                Err(KERR_NOT_READY)
+            }
             _ => Err(KERR_ARGUMENT),
         }
     }
@@ -1617,11 +1655,21 @@ impl Modem {
                         self.now
                     ));
                 }
-                self.status.calls = next;
                 let utc = p.utc_ms();
                 if self.log.observe(next.as_slice(), self.now, utc) {
                     self.status.log_revision = self.status.log_revision.wrapping_add(1);
                 }
+                self.block_calls(p, &next);
+                // Blocked calls are never shown or rung: clients and the alerts see the list without them.
+                let mut kept = 0;
+                for i in 0..usize::from(next.len) {
+                    if !self.log.is_blocked(next.entries[i].id) {
+                        next.entries[kept] = next.entries[i];
+                        kept += 1;
+                    }
+                }
+                next.len = kept as u8;
+                self.status.calls = next;
                 // Incoming/waiting gets UI priority; audio independently scans the complete list.
                 self.status.call = next
                     .as_slice()
@@ -2812,6 +2860,97 @@ mod tests {
             &from_modem(qrtr::TYPE_DATA, 77, 0x23, &ok(txn, id).finish()),
         );
         assert_eq!(f.sent.len(), n);
+    }
+
+    fn call_ind_numbered(calls: &[u8], numbers: &[(u8, u8, &str)]) -> Vec<u8> {
+        let mut r = alloc::vec![numbers.len() as u8];
+        for (id, pres, n) in numbers {
+            r.extend_from_slice(&[*id, *pres, n.len() as u8]);
+            r.extend_from_slice(n.as_bytes());
+        }
+        from_modem(
+            qrtr::TYPE_DATA,
+            77,
+            0x23,
+            &qmi::Builder::new(qmi::INDICATION, 1, voice::ALL_CALL_STATUS_IND)
+                .tlv(1, calls)
+                .tlv(0x10, &r)
+                .finish(),
+        )
+    }
+
+    #[test]
+    fn blocked_call_is_rejected_before_it_rings() {
+        use phone_rules::block::{Rule, why};
+        let (mut m, mut f) = (modem(), fake());
+        m.block.rules.push(Rule {
+            prefix: true,
+            calls: true,
+            messages: false,
+            number: String::from("+1900"),
+        });
+        m.handle(&mut f, &ns(VOICE, 77));
+        // setup without a number: nothing decided yet, nothing sent
+        let n = f.sent.len();
+        m.handle(&mut f, &call_ind(&[1, 1, 10, 0, 2, 3, 0, 0]));
+        assert_eq!(f.sent.len(), n);
+        m.handle(
+            &mut f,
+            &call_ind_numbered(&[1, 1, 2, 0, 2, 3, 0, 0], &[(1, 0, "+19005550101")]),
+        );
+        let (_, _, id, _) = req(f.sent.last().unwrap());
+        assert_eq!((id, sent_tlv(&f, 1)), (voice::MANAGE_CALLS, alloc::vec![1]));
+        assert_eq!(m.status.calls.len, 0, "clients never see a blocked call");
+        assert_eq!(m.status.call.state, call::END);
+        m.handle(
+            &mut f,
+            &call_ind_numbered(&[1, 1, 9, 0, 2, 3, 0, 0], &[(1, 0, "+19005550101")]),
+        );
+        let e = m.log.entries[0];
+        assert_eq!((e.kind, e.why), (modem_ipc::log::BLOCKED, why::PREFIX));
+        assert_eq!(m.status.missed, 0);
+        // another number rings normally
+        m.handle(
+            &mut f,
+            &call_ind_numbered(&[1, 2, 2, 0, 2, 3, 0, 0], &[(2, 0, "+37491000000")]),
+        );
+        assert_eq!(
+            (m.status.calls.len, m.status.call.state),
+            (1, call::INCOMING)
+        );
+    }
+
+    #[test]
+    fn private_callers_blocked_by_switch() {
+        let (mut m, mut f) = (modem(), fake());
+        m.block.private = true;
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(
+            &mut f,
+            &call_ind_numbered(&[1, 1, 2, 0, 2, 3, 0, 0], &[(1, 1, "")]),
+        );
+        assert_eq!(m.status.calls.len, 0);
+        assert_eq!(req(f.sent.last().unwrap()).2, voice::MANAGE_CALLS);
+    }
+
+    #[test]
+    fn end_and_answer_releases_active_for_waiting() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(
+            &mut f,
+            &call_ind(&[2, 1, 3, 0, 1, 3, 0, 0, 2, 7, 0, 2, 3, 0, 0]),
+        );
+        m.manage(&mut f, modem_ipc::manage::END_ANSWER, 0).unwrap();
+        let (_, _, id, _) = req(f.sent.last().unwrap());
+        assert_eq!((id, sent_tlv(&f, 1)), (voice::MANAGE_CALLS, alloc::vec![2]));
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(&mut f, &call_ind(&[1, 1, 3, 0, 1, 3, 0, 0]));
+        assert_eq!(
+            m.manage(&mut f, modem_ipc::manage::END_ANSWER, 0),
+            Err(KERR_NOT_READY)
+        );
     }
 
     fn nas_reads(f: &Fake) -> usize {

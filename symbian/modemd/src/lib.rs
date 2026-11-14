@@ -468,6 +468,16 @@ impl Daemon {
         }
     }
 
+    /// block.db: the blocklist with the known-number hashes (phone_rules::block, "NBL1").
+    fn save_block(&self) -> i32 {
+        let Some(m) = &self.modem else {
+            return NOT_READY;
+        };
+        Self::save_private("block.db", &m.block.encode(true))
+            .err()
+            .unwrap_or(0)
+    }
+
     fn fail(&mut self, what: &str, r: i32) {
         dprintln!("[modemd] {} failed ({})", what, r);
         self.phase = Phase::Failed;
@@ -1133,6 +1143,9 @@ impl Service for Daemon {
                 | op::CALL_LOG
                 | op::CLEAR_LOG
                 | op::CALL_SETTINGS
+                | op::BLOCK_GET
+                | op::BLOCK_SET
+                | op::KNOWN_SET
         ) && !matches!(self.phase, Phase::Running)
             && !(audio_op && matches!(self.adsp, adsp::Adsp::Up))
         {
@@ -1333,6 +1346,68 @@ impl Service for Daemon {
             op::CALL_WAITING => self.modem.as_mut().map_or(NOT_READY, |m| {
                 m.call_waiting(&mut Hal, msg.int(0)).err().unwrap_or(0)
             }),
+            // the blocklist (v2.2)
+            op::BLOCK_GET => match (&self.modem, msg.des_max_len(0)) {
+                (Some(m), Ok(room)) => {
+                    let b = m.block.encode(false);
+                    if b.len() > room {
+                        err::KERR_OVERFLOW
+                    } else {
+                        msg.write8(0, &b, 0).map_or_else(|e| e, |_| 0)
+                    }
+                }
+                (None, _) => NOT_READY,
+                (_, Err(e)) => e,
+            },
+            op::BLOCK_SET | op::KNOWN_SET => {
+                let max = if msg.function() == op::BLOCK_SET {
+                    modem_ipc::MAX_BLOCK_BYTES
+                } else {
+                    modem_ipc::MAX_KNOWN_BYTES
+                };
+                let read = msg.des_len(0).and_then(|n| {
+                    if n <= max {
+                        msg.read8_vec(0)
+                    } else {
+                        Err(err::KERR_ARGUMENT)
+                    }
+                });
+                match (&mut self.modem, read) {
+                    (None, _) => NOT_READY,
+                    (_, Err(e)) => e,
+                    (Some(m), Ok(b)) if msg.function() == op::BLOCK_SET => {
+                        match modem_proto::phone_rules::block::List::decode(&b) {
+                            Some(list) => {
+                                let known = core::mem::take(&mut m.block.known);
+                                m.block = list;
+                                m.block.known = known;
+                                dprintln!(
+                                    "[modemd] blocklist: {} rules, private {}, unknown {}",
+                                    m.block.rules.len(),
+                                    m.block.private,
+                                    m.block.unknown
+                                );
+                                self.save_block()
+                            }
+                            None => err::KERR_ARGUMENT,
+                        }
+                    }
+                    (Some(m), Ok(b)) => {
+                        if b.len() % 4 != 0 {
+                            err::KERR_ARGUMENT
+                        } else {
+                            let keys = b
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .map(|k| u32::from_le_bytes(*k))
+                                .collect();
+                            m.block.set_known(keys);
+                            self.save_block()
+                        }
+                    }
+                }
+            }
             _ => err::KERR_NOT_SUPPORTED,
         };
         if r == 0 && matches!(msg.function(), op::ANSWER | op::HANGUP) {
@@ -1445,6 +1520,20 @@ fn main() -> i32 {
             if let Some(mut log) = modem_proto::calllog::CallLog::decode(&b[..n]) {
                 log.days = m.log.days;
                 m.log = log;
+            }
+        }
+        // the blocklist (v2.2): a missing or unreadable block.db blocks nothing
+        if let Some(m) = &mut d.modem
+            && let Ok(f) = e32::fs::File::open(
+                &fs,
+                "C:\\private\\e0003001\\block.db",
+                e32::fs::mode::READ | e32::fs::mode::SHARE_READERS_ONLY,
+            )
+        {
+            let mut b = vec![0u8; modem_ipc::MAX_BLOCK_BYTES + modem_ipc::MAX_KNOWN_BYTES];
+            let n = f.read_at(0, &mut b).unwrap_or(0);
+            if let Some(list) = modem_proto::phone_rules::block::List::decode(&b[..n]) {
+                m.block = list;
             }
         }
     }

@@ -12,6 +12,10 @@
 //!   every entry, arg 1 = a [`log`] kind or 0 for any. [`op::CALL_SETTINGS`] arg 0 = [`clir`], arg 1 = log days.
 //! - call waiting (C8): [`op::CALL_WAITING`] arg 0 = [`waiting`] request; the network's answer arrives as
 //!   [`Status::waiting`].
+//! - blocking (v2.2): [`op::BLOCK_GET`] writes the blocklist (`phone_rules::block::List::encode(false)`) into the
+//!   des8 in arg 0, [`op::BLOCK_SET`] replaces it from arg 0, [`op::KNOWN_SET`] replaces the contact-number hashes
+//!   (u32 LE each, `phone_rules::block::known_key`) from arg 0. A blocked call is rejected as busy before it rings and
+//!   logged as [`log::BLOCKED`] with [`LogEntry::why`].
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -19,7 +23,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 1, 0);
+pub const VERSION: (i8, i8, i16) = (2, 2, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -51,7 +55,18 @@ pub mod op {
     pub const CALL_SETTINGS: i32 = 19;
     /// arg0 waiting::QUERY / ACTIVATE / DEACTIVATE.
     pub const CALL_WAITING: i32 = 20;
+    /// arg0 writable des8 for the encoded blocklist (without known hashes).
+    pub const BLOCK_GET: i32 = 21;
+    /// arg0 des8: the encoded blocklist; its known hashes are ignored.
+    pub const BLOCK_SET: i32 = 22;
+    /// arg0 des8: known-number hashes, u32 LE each.
+    pub const KNOWN_SET: i32 = 23;
 }
+
+/// The largest encoded blocklist (`phone_rules::block`: 100 rules of up to 32 bytes).
+pub const MAX_BLOCK_BYTES: usize = 4 + 2 + 100 * 34 + 2;
+/// The largest [`op::KNOWN_SET`] payload.
+pub const MAX_KNOWN_BYTES: usize = 2000 * 4;
 
 /// Caller ID for our calls ([`op::CALL_SETTINGS`]), the Symbian^3 values: the network's default, or a `#31#`/`*31#`
 /// prefix on every call.
@@ -83,6 +98,8 @@ pub mod log {
     pub const MISSED: u8 = 3;
     /// an incoming call we hung up while it rang
     pub const REJECTED: u8 = 4;
+    /// an incoming call MODEMD rejected because the blocklist matched ([`LogEntry::why`])
+    pub const BLOCKED: u8 = 5;
 }
 
 /// The most calls the log keeps (the Symbian^3 log kept 20 per list: missed, received, dialled).
@@ -101,10 +118,12 @@ pub struct LogEntry {
     /// the network's presentation of the number (phone_rules::caller::presentation)
     pub presentation: u8,
     pub number: Text,
+    /// why a [`log::BLOCKED`] call was blocked (`phone_rules::block::why`); 0 otherwise
+    pub why: u8,
 }
 
 impl LogEntry {
-    pub const SIZE: usize = 4 + 8 + 4 + 2 + 33;
+    pub const SIZE: usize = 4 + 8 + 4 + 2 + 33 + 1;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -115,6 +134,7 @@ impl LogEntry {
         b[17] = self.presentation;
         b[18] = self.number.len;
         b[19..51].copy_from_slice(&self.number.buf);
+        b[51] = self.why;
         b
     }
 
@@ -133,6 +153,7 @@ impl LogEntry {
             kind: b[16],
             presentation: b[17],
             number: Text { len, buf },
+            why: b[51],
         })
     }
 }
@@ -163,6 +184,8 @@ pub mod manage {
     pub const RESUME: i32 = 2;
     pub const SWAP: i32 = 3;
     pub const MERGE: i32 = 4;
+    /// end the active call(s) and answer the waiting one (v2.2)
+    pub const END_ANSWER: i32 = 5;
 }
 
 pub const MAX_CALLS: usize = 8;
@@ -548,13 +571,14 @@ mod tests {
             id: 7,
             utc: 1_794_513_007_123,
             duration_s: 151,
-            kind: log::RECEIVED,
+            kind: log::BLOCKED,
             presentation: 0,
             number: Text::new("+37491234567"),
+            why: 2,
         };
         let b = e.to_bytes();
         assert_eq!(LogEntry::from_bytes(&b), Some(e));
-        assert_eq!(LogEntry::from_bytes(&b[..50]), None);
+        assert_eq!(LogEntry::from_bytes(&b[..51]), None);
         let mut bad = b;
         bad[18] = 33;
         assert_eq!(LogEntry::from_bytes(&bad), None);
