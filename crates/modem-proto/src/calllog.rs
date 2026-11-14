@@ -95,6 +95,11 @@ impl CallLog {
         }
     }
 
+    /// Call `id` is ringing and the user rejected it (not a missed call).
+    pub fn is_rejected(&self, id: u8) -> bool {
+        self.live.iter().any(|l| l.id == id && l.rejected)
+    }
+
     fn record(&mut self, l: Live, now_ms: u64) -> bool {
         if self.days == 0 {
             return false;

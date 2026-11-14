@@ -202,6 +202,8 @@ pub struct Modem {
     pub clir: i32,
     /// the call waiting request with the network (modem_ipc::waiting)
     waiting_request: i32,
+    /// a call being rejected as busy (UDUB); END follows if the modem refuses it
+    rejecting: Option<u8>,
     response_seen: bool,
     heartbeat_at: u64,
 }
@@ -301,6 +303,7 @@ impl Modem {
             log: calllog::CallLog::default(),
             clir: modem_ipc::clir::NETWORK,
             waiting_request: 0,
+            rejecting: None,
             response_seen: false,
             heartbeat_at: 0,
             ipa_up: false,
@@ -695,7 +698,14 @@ impl Modem {
             return Err(KERR_NOT_READY);
         }
         if c.incoming && matches!(c.state, call::INCOMING | call::WAITING) {
+            // Reject = User Determined User Busy (3GPP 22.030 CHLD=0, oFono's set_udub): the caller hears busy /
+            // declined. A plain END released it like a lost call and the caller's network said "not reachable"
+            // (2026-11-14). QMI VOICE Manage Calls type 1 = release held or UDUB the waiting/incoming call; END is the
+            // fallback when the modem refuses it.
             self.log.rejected(c.id);
+            self.user_request(p, VOICE, voice::MANAGE_CALLS, &[(1, &[1])])?;
+            self.rejecting = Some(c.id);
+            return Ok(());
         }
         // DIAL can publish its indication before its response. Cancellation bypasses the
         // user-command slot only for that selected outgoing call, never an existing held call.
@@ -1462,6 +1472,12 @@ impl Modem {
             {
                 self.status.waiting = modem_ipc::waiting::ERROR;
             }
+            if (service, m.id) == (VOICE, voice::MANAGE_CALLS)
+                && let Some(id) = self.rejecting.take()
+            {
+                p.log(format_args!("voice: busy reject refused; ending call {id}"));
+                self.request(p, VOICE, voice::END, &[(1, &[id])]);
+            }
             return;
         };
         match (service, m.id) {
@@ -1500,6 +1516,7 @@ impl Modem {
                 self.ipa.modem_ready = true;
                 self.ipa_complete(p);
             }
+            (VOICE, voice::MANAGE_CALLS) => self.rejecting = None,
             (VOICE, voice::GET_CALL_WAITING) => {
                 let on = m.u8(0x10).is_some_and(|c| c & voice::CLASS_VOICE != 0);
                 self.status.waiting = if on {
@@ -1581,6 +1598,7 @@ impl Modem {
                         && c.incoming
                         && !matches!(c.state, call::NONE | call::END)
                         && !self.answered.contains(&c.id)
+                        && !self.log.is_rejected(c.id)
                     {
                         self.status.missed = self.status.missed.wrapping_add(1);
                     }
@@ -2764,6 +2782,36 @@ mod tests {
             &call_ind(&[2, 2, 9, 0, 2, 3, 0, 0, 1, 3, 0, 1, 3, 0, 0]),
         );
         assert_eq!(m.status.missed, 1);
+    }
+
+    // a ringing call rejected = busy (UDUB, Manage Calls type 1), END only if the modem refuses that; logged as rejected
+    #[test]
+    fn reject_is_busy_with_end_fallback() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(&mut f, &call_ind(&[1, 1, 2, 0, 2, 3, 0, 0])); // call 1 incoming
+        m.end_call(&mut f, 1).unwrap();
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!((id, sent_tlv(&f, 1)), (voice::MANAGE_CALLS, alloc::vec![1]));
+        let refused = qmi::Builder::new(qmi::RESPONSE, txn, id).result(3).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 77, 0x23, &refused));
+        assert_eq!(req(f.sent.last().unwrap()).2, voice::END);
+        assert_eq!(sent_tlv(&f, 1), alloc::vec![1]);
+        m.handle(&mut f, &call_ind(&[1, 1, 9, 0, 2, 3, 0, 0]));
+        assert_eq!(m.log.entries[0].kind, modem_ipc::log::REJECTED);
+        assert_eq!(m.status.missed, 0);
+        // accepted: no END afterwards
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 77));
+        m.handle(&mut f, &call_ind(&[1, 1, 2, 0, 2, 3, 0, 0]));
+        m.end_call(&mut f, 1).unwrap();
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        let n = f.sent.len();
+        m.handle(
+            &mut f,
+            &from_modem(qrtr::TYPE_DATA, 77, 0x23, &ok(txn, id).finish()),
+        );
+        assert_eq!(f.sent.len(), n);
     }
 
     fn nas_reads(f: &Fake) -> usize {
