@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "phone-rules"
+description = "Phone rules shared by MODEMD and neoui: dial-string classification, service codes, emergency numbers, caller-name matching (docs/symbian-phone-sources.md)"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false

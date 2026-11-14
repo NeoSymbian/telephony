@@ -7,6 +7,11 @@
 //!   [`op::VOLUME`] arg 0 = 0..=10, [`op::DTMF`] arg 0 = the key (`0-9`, `*`, `#`) or -1 to stop its tone;
 //! - no call (Dev tools): [`op::AUDIO_TEST`] arg 0 = 1 loudspeaker, 2 earpiece (the mic looped back to the
 //!   amps), 0 stop; KErrInUse (-14) during a call.
+//! - the call log (C8, v2.1): [`op::CALL_LOG`] writes up to [`MAX_LOG`] [`LogEntry`]s, newest first, into the des8 in
+//!   arg 0; [`Status::log_revision`] changes whenever the log does. [`op::CLEAR_LOG`] arg 0 = entry id or 0 for
+//!   every entry, arg 1 = a [`log`] kind or 0 for any. [`op::CALL_SETTINGS`] arg 0 = [`clir`], arg 1 = log days.
+//! - call waiting (C8): [`op::CALL_WAITING`] arg 0 = [`waiting`] request; the network's answer arrives as
+//!   [`Status::waiting`].
 //!
 //! Each op completes with KErrNone or an error: KErrNotReady (-18) without a modem/call to act on, KErrArgument (-6)
 //! for a number it refuses.
@@ -14,7 +19,7 @@
 
 pub const NAME: &str = "NeoModem";
 /// major, minor, build
-pub const VERSION: (i8, i8, i16) = (2, 0, 0);
+pub const VERSION: (i8, i8, i16) = (2, 1, 0);
 
 pub mod op {
     pub const STATUS: i32 = 1;
@@ -38,6 +43,98 @@ pub mod op {
     /// arg0 volume 0..10, arg1 silent, arg2 vibration.
     pub const RING_SETTINGS: i32 = 15;
     pub const RETRY: i32 = 16;
+    /// arg0 writable des8 for up to MAX_LOG LogEntry records, newest first.
+    pub const CALL_LOG: i32 = 17;
+    /// arg0 entry id (0 = all), arg1 log kind (0 = any).
+    pub const CLEAR_LOG: i32 = 18;
+    /// arg0 clir::*, arg1 days the log keeps calls (0 = no log, 1, 10, 30).
+    pub const CALL_SETTINGS: i32 = 19;
+    /// arg0 waiting::QUERY / ACTIVATE / DEACTIVATE.
+    pub const CALL_WAITING: i32 = 20;
+}
+
+/// Caller ID for our calls ([`op::CALL_SETTINGS`]), the Symbian^3 values: the network's default, or a `#31#`/`*31#`
+/// prefix on every call.
+pub mod clir {
+    pub const NETWORK: i32 = 0;
+    pub const HIDE: i32 = 1;
+    pub const SHOW: i32 = 2;
+}
+
+/// Call waiting: the requests of [`op::CALL_WAITING`] and the states of [`Status::waiting`].
+pub mod waiting {
+    pub const QUERY: i32 = 0;
+    pub const ACTIVATE: i32 = 1;
+    pub const DEACTIVATE: i32 = 2;
+
+    pub const UNKNOWN: u8 = 0;
+    /// a request is with the network
+    pub const BUSY: u8 = 1;
+    pub const ON: u8 = 2;
+    pub const OFF: u8 = 3;
+    /// the network refused or didn't answer
+    pub const ERROR: u8 = 4;
+}
+
+/// [`LogEntry::kind`]
+pub mod log {
+    pub const DIALLED: u8 = 1;
+    pub const RECEIVED: u8 = 2;
+    pub const MISSED: u8 = 3;
+    /// an incoming call we hung up while it rang
+    pub const REJECTED: u8 = 4;
+}
+
+/// The most calls the log keeps (the Symbian^3 log kept 20 per list: missed, received, dialled).
+pub const MAX_LOG: usize = 60;
+
+/// One call of the log (C8).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct LogEntry {
+    /// never 0; grows with every entry
+    pub id: u32,
+    /// when the call started: UTC, Unix milliseconds
+    pub utc: i64,
+    /// connected time; 0 for missed and rejected calls
+    pub duration_s: u32,
+    pub kind: u8,
+    /// the network's presentation of the number (phone_rules::caller::presentation)
+    pub presentation: u8,
+    pub number: Text,
+}
+
+impl LogEntry {
+    pub const SIZE: usize = 4 + 8 + 4 + 2 + 33;
+
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut b = [0u8; Self::SIZE];
+        b[..4].copy_from_slice(&self.id.to_le_bytes());
+        b[4..12].copy_from_slice(&self.utc.to_le_bytes());
+        b[12..16].copy_from_slice(&self.duration_s.to_le_bytes());
+        b[16] = self.kind;
+        b[17] = self.presentation;
+        b[18] = self.number.len;
+        b[19..51].copy_from_slice(&self.number.buf);
+        b
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let b = b.get(..Self::SIZE)?;
+        let len = b[18];
+        let mut buf = [0; TEXT];
+        buf.copy_from_slice(&b[19..51]);
+        if len as usize > TEXT || core::str::from_utf8(&buf[..len as usize]).is_err() {
+            return None;
+        }
+        Some(Self {
+            id: u32::from_le_bytes(b[..4].try_into().ok()?),
+            utc: i64::from_le_bytes(b[4..12].try_into().ok()?),
+            duration_s: u32::from_le_bytes(b[12..16].try_into().ok()?),
+            kind: b[16],
+            presentation: b[17],
+            number: Text { len, buf },
+        })
+    }
 }
 
 /// [`Status::modem`]
@@ -166,6 +263,8 @@ pub struct Call {
     pub state: u8,
     pub incoming: bool,
     pub number: Text,
+    /// the network's presentation of `number` (phone_rules::caller::presentation; 0 allowed)
+    pub presentation: u8,
 }
 
 /// The call's audio (C6): what the in-call buttons show.
@@ -217,10 +316,18 @@ pub struct Status {
     pub ring: Ring,
     pub missed: u32,
     pub nitz: Nitz,
+    /// Changes whenever the call log does (v2.1): fetch it again with [`op::CALL_LOG`].
+    pub log_revision: u32,
+    /// Call waiting on the network as far as we know ([`waiting`] states, v2.1).
+    pub waiting: u8,
 }
 
+/// v2.1's tail: the calls' presentations, the log revision, call waiting, the selected call's presentation.
+const V21: usize = MAX_CALLS + 4 + 1 + 1;
+const TAIL: usize = 110 + MAX_CALLS * 36;
+
 impl Status {
-    pub const SIZE: usize = 78 + 32 + MAX_CALLS * 36;
+    pub const SIZE: usize = 110 + MAX_CALLS * 36 + V21;
 
     pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         let mut b = [0u8; Self::SIZE];
@@ -267,7 +374,12 @@ impl Status {
             let at = 110 + i * 36;
             b[at..at + 4].copy_from_slice(&[c.id, c.state, c.incoming as u8, c.number.len]);
             b[at + 4..at + 36].copy_from_slice(&c.number.buf);
+            b[TAIL + i] = c.presentation;
         }
+        let at = TAIL + MAX_CALLS;
+        b[at..at + 4].copy_from_slice(&self.log_revision.to_le_bytes());
+        b[at + 4] = self.waiting;
+        b[at + 5] = self.call.presentation;
         b
     }
 
@@ -294,6 +406,7 @@ impl Status {
                 state: b[at + 1],
                 incoming: b[at + 2] != 0,
                 number: text(at + 3)?,
+                presentation: b[TAIL + i],
             };
         }
         Some(Self {
@@ -308,6 +421,7 @@ impl Status {
                 state: b[6],
                 incoming: b[7] != 0,
                 number: text(41)?,
+                presentation: b[TAIL + MAX_CALLS + 5],
             },
             audio: Audio {
                 on: b[74] != 0,
@@ -335,6 +449,10 @@ impl Status {
                 dst: b[107],
                 seq: u16::from_le_bytes(b[108..110].try_into().ok()?),
             },
+            log_revision: u32::from_le_bytes(
+                b[TAIL + MAX_CALLS..TAIL + MAX_CALLS + 4].try_into().ok()?,
+            ),
+            waiting: b[TAIL + MAX_CALLS + 4],
         })
     }
 }
@@ -357,6 +475,7 @@ mod tests {
                 state: call::INCOMING,
                 incoming: true,
                 number: Text::new("+37400000012"),
+                presentation: 0,
             },
             audio: Audio {
                 on: true,
@@ -394,6 +513,8 @@ mod tests {
                 dst: 1,
                 seq: 3,
             },
+            log_revision: 41,
+            waiting: waiting::ON,
             ..Default::default()
         };
         s.calls.len = 2;
@@ -402,12 +523,14 @@ mod tests {
             state: call::CONVERSATION,
             incoming: false,
             number: Text::new("+37400000001"),
+            presentation: 0,
         };
         s.calls.entries[1] = Call {
             id: 2,
             state: call::WAITING,
             incoming: true,
             number: Text::new("+37400000002"),
+            presentation: 1,
         };
         s.call = s.calls.entries[1];
         let mut bytes = s.to_bytes();
@@ -417,5 +540,23 @@ mod tests {
         bytes[97] = 2;
         bytes[113] = 33;
         assert!(Status::from_bytes(&bytes).is_none());
+    }
+
+    #[test]
+    fn log_entry_round_trip() {
+        let e = LogEntry {
+            id: 7,
+            utc: 1_794_513_007_123,
+            duration_s: 151,
+            kind: log::RECEIVED,
+            presentation: 0,
+            number: Text::new("+37491234567"),
+        };
+        let b = e.to_bytes();
+        assert_eq!(LogEntry::from_bytes(&b), Some(e));
+        assert_eq!(LogEntry::from_bytes(&b[..50]), None);
+        let mut bad = b;
+        bad[18] = 33;
+        assert_eq!(LogEntry::from_bytes(&bad), None);
     }
 }

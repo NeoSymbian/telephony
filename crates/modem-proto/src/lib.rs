@@ -8,6 +8,7 @@
 extern crate alloc;
 
 pub mod apr;
+pub mod calllog;
 pub mod ipa;
 pub mod locator;
 pub mod nas;
@@ -58,6 +59,10 @@ pub trait Platform {
     /// The firmware is in mission mode: start the host's copy engines, HTC and WMI (kernel HAL WlanStart, W2).
     fn wlan_start(&mut self) -> Result<(), i32> {
         Err(-5)
+    }
+    /// The wall clock, UTC Unix milliseconds, for the call log; 0 = unknown.
+    fn utc_ms(&mut self) -> i64 {
+        0
     }
 }
 
@@ -191,6 +196,12 @@ pub struct Modem {
     radio_refusals: u8,
     pin_id: u8,
     answered: Vec<u8>,
+    /// The call log (C8); MODEMD saves it when `log.dirty`.
+    pub log: calllog::CallLog,
+    /// Caller ID for our calls: modem_ipc::clir (C8).
+    pub clir: i32,
+    /// the call waiting request with the network (modem_ipc::waiting)
+    waiting_request: i32,
     response_seen: bool,
     heartbeat_at: u64,
 }
@@ -287,6 +298,9 @@ impl Modem {
             radio_refusals: 0,
             pin_id: 1,
             answered: Vec::new(),
+            log: calllog::CallLog::default(),
+            clir: modem_ipc::clir::NETWORK,
+            waiting_request: 0,
             response_seen: false,
             heartbeat_at: 0,
             ipa_up: false,
@@ -680,6 +694,9 @@ impl Modem {
         if matches!(c.state, call::NONE | call::END) {
             return Err(KERR_NOT_READY);
         }
+        if c.incoming && matches!(c.state, call::INCOMING | call::WAITING) {
+            self.log.rejected(c.id);
+        }
         // DIAL can publish its indication before its response. Cancellation bypasses the
         // user-command slot only for that selected outgoing call, never an existing held call.
         let dialing = self
@@ -741,6 +758,32 @@ impl Modem {
         }
     }
 
+    /// Call waiting on the network (modem_ipc::op::CALL_WAITING): query it, or turn it on or off. The answer arrives
+    /// in `status.waiting`.
+    pub fn call_waiting(&mut self, p: &mut dyn Platform, action: i32) -> Result<(), i32> {
+        use modem_ipc::waiting;
+        let r = match action {
+            waiting::QUERY => self.user_request(
+                p,
+                VOICE,
+                voice::GET_CALL_WAITING,
+                &[(0x10, &[voice::CLASS_VOICE])],
+            ),
+            waiting::ACTIVATE | waiting::DEACTIVATE => self.user_request(
+                p,
+                VOICE,
+                voice::SET_SUPS_SERVICE,
+                &[(1, &[action as u8, voice::REASON_CALL_WAITING])],
+            ),
+            _ => return Err(KERR_ARGUMENT),
+        };
+        if r.is_ok() {
+            self.waiting_request = action;
+            self.status.waiting = waiting::BUSY;
+        }
+        r
+    }
+
     /// Rebuild volatile state after a confirmed kernel stop. RAM EFS and user intent survive.
     /// `keep_adsp`: the ADSP kept running, so its servers, queued replies, HELLO and TFTP traffic stay. The radio
     /// storage (RAM EFS), the startup policy, the trace switch and the port counter always do; the Wi-Fi firmware's
@@ -768,7 +811,12 @@ impl Modem {
         let mut readers = core::mem::take(&mut self.readers);
         readers.retain(|r| not_modem(r.peer.0));
         let (trace, radio_enabled, next_port) = (self.trace, self.radio_enabled, self.next_port);
+        // the modem's calls are gone with it: log them as ended now
+        self.log.observe(&[], self.now, 0);
+        let (log, clir) = (core::mem::take(&mut self.log), self.clir);
         *self = Self::with_rmtfs(rmtfs);
+        self.log = log;
+        self.clir = clir;
         self.trace = trace;
         self.radio_enabled = radio_enabled;
         self.next_port = next_port;
@@ -780,6 +828,7 @@ impl Modem {
         self.status.airplane = old.airplane;
         self.status.ring = old.ring;
         self.status.missed = old.missed;
+        self.status.log_revision = old.log_revision.wrapping_add(1);
         self.status.generation = old.generation.wrapping_add(1);
         self.status.revision = old.revision;
         self.servers = retained;
@@ -825,6 +874,9 @@ impl Modem {
             self.command = None;
             self.status.pending = false;
             self.status.result = -33;
+            if self.status.waiting == modem_ipc::waiting::BUSY {
+                self.status.waiting = modem_ipc::waiting::ERROR;
+            }
         }
         self.maybe_online(p);
         if !self.outbox.is_empty() && now_ms.saturating_sub(self.outbox_at) >= OUTBOX_RETRY_MS {
@@ -909,6 +961,19 @@ impl Modem {
     /// Place a call (modem_ipc::op::DIAL). KErrArgument for a number [`voice::dialable`] refuses, KErrInUse while a
     /// call is up, KErrNotReady before VOICE is there.
     pub fn dial(&mut self, p: &mut dyn Platform, number: &str) -> Result<(), i32> {
+        // Caller ID (C8): a typed *31#/#31# wins, else the setting's prefix (Symbian^3 sends CLIR the same way).
+        let shown = number
+            .strip_prefix("*31#")
+            .or_else(|| number.strip_prefix("#31#"))
+            .unwrap_or(number);
+        let prefix = match self.clir {
+            _ if shown.len() != number.len() => "",
+            modem_ipc::clir::HIDE => "#31#",
+            modem_ipc::clir::SHOW => "*31#",
+            _ => "",
+        };
+        let wire = alloc::format!("{prefix}{number}");
+        let number = shown;
         if !voice::dialable(number) {
             return Err(KERR_ARGUMENT);
         }
@@ -925,15 +990,16 @@ impl Modem {
         {
             return Err(KERR_IN_USE);
         }
-        self.user_request(p, VOICE, voice::DIAL, &[(1, number.as_bytes())])?;
+        self.user_request(p, VOICE, voice::DIAL, &[(1, wire.as_bytes())])?;
         self.hangup_pending = false;
         self.status.call = Call {
             id: 0,
             state: call::ORIGINATION,
             incoming: false,
             number: Text::new(number),
+            presentation: 0,
         };
-        p.log(format_args!("voice: dial {}", mask(number)));
+        p.log(format_args!("voice: dial {}{}", prefix, mask(number)));
         Ok(())
     }
 
@@ -1392,6 +1458,10 @@ impl Modem {
             if (service, m.id) == (VOICE, voice::DIAL) {
                 self.status.call.state = call::END;
             }
+            if service == VOICE && matches!(m.id, voice::GET_CALL_WAITING | voice::SET_SUPS_SERVICE)
+            {
+                self.status.waiting = modem_ipc::waiting::ERROR;
+            }
             return;
         };
         match (service, m.id) {
@@ -1429,6 +1499,21 @@ impl Modem {
                 p.log(format_args!("ipa: the modem took INIT_DRIVER"));
                 self.ipa.modem_ready = true;
                 self.ipa_complete(p);
+            }
+            (VOICE, voice::GET_CALL_WAITING) => {
+                let on = m.u8(0x10).is_some_and(|c| c & voice::CLASS_VOICE != 0);
+                self.status.waiting = if on {
+                    modem_ipc::waiting::ON
+                } else {
+                    modem_ipc::waiting::OFF
+                };
+            }
+            (VOICE, voice::SET_SUPS_SERVICE) => {
+                self.status.waiting = if self.waiting_request == modem_ipc::waiting::ACTIVATE {
+                    modem_ipc::waiting::ON
+                } else {
+                    modem_ipc::waiting::OFF
+                };
             }
             (VOICE, voice::DIAL) => {
                 self.status.call.id = m.u8(0x10).unwrap_or(0);
@@ -1469,6 +1554,7 @@ impl Modem {
                             || previous.map_or(Text::default(), |x| x.number),
                             |n| Text::new(&n),
                         ),
+                        presentation: c.presentation,
                     };
                     if previous.is_none_or(|old| (old.id, old.state) != (c.id, c.state)) {
                         p.log(format_args!(
@@ -1514,6 +1600,10 @@ impl Modem {
                     ));
                 }
                 self.status.calls = next;
+                let utc = p.utc_ms();
+                if self.log.observe(next.as_slice(), self.now, utc) {
+                    self.status.log_revision = self.status.log_revision.wrapping_add(1);
+                }
                 // Incoming/waiting gets UI priority; audio independently scans the complete list.
                 self.status.call = next
                     .as_slice()
@@ -2355,6 +2445,63 @@ mod tests {
         assert_eq!((h.src_port, h.dst_port), (IPA_PORT, 30)); // to the modem's server, not the requester
         assert_eq!((ind.ty, ind.id), (qmi::INDICATION, ipa::INIT_COMPLETE));
         assert!(f.logs.iter().any(|l| l == "ipa: handshake complete"));
+    }
+
+    fn sent_tlv(f: &Fake, t: u8) -> Vec<u8> {
+        let (_, pay) = qrtr::decode(f.sent.last().unwrap()).unwrap();
+        qmi::Msg::parse(pay).unwrap().tlv(t).unwrap().to_vec()
+    }
+
+    // C8: caller ID goes as a *31#/#31# prefix; a typed one wins; the shown number has none
+    #[test]
+    fn caller_id_prefix() {
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        m.clir = modem_ipc::clir::HIDE;
+        m.dial(&mut f, "+37400000012").unwrap();
+        assert_eq!(sent_tlv(&f, 1), b"#31#+37400000012");
+        assert_eq!(m.status.call.number.as_str(), "+37400000012");
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        m.clir = modem_ipc::clir::HIDE;
+        m.dial(&mut f, "*31#+37400000012").unwrap();
+        assert_eq!(sent_tlv(&f, 1), b"*31#+37400000012");
+        assert_eq!(m.status.call.number.as_str(), "+37400000012");
+    }
+
+    // C8: call waiting asks the network; the answer (or a refusal) lands in status.waiting
+    #[test]
+    fn call_waiting_query_and_set() {
+        use modem_ipc::waiting;
+        let (mut m, mut f) = (modem(), fake());
+        m.handle(&mut f, &ns(VOICE, 50));
+        m.call_waiting(&mut f, waiting::QUERY).unwrap();
+        assert_eq!(m.status.waiting, waiting::BUSY);
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(
+            (id, sent_tlv(&f, 0x10)),
+            (voice::GET_CALL_WAITING, alloc::vec![1])
+        );
+        let reply = ok(txn, id).u8(0x10, 0x01).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 50, 0x23, &reply));
+        assert_eq!(m.status.waiting, waiting::ON);
+        m.call_waiting(&mut f, waiting::DEACTIVATE).unwrap();
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        assert_eq!(
+            (id, sent_tlv(&f, 1)),
+            (voice::SET_SUPS_SERVICE, alloc::vec![2, 0x0f])
+        );
+        m.handle(
+            &mut f,
+            &from_modem(qrtr::TYPE_DATA, 50, 0x23, &ok(txn, id).finish()),
+        );
+        assert_eq!(m.status.waiting, waiting::OFF);
+        m.call_waiting(&mut f, waiting::ACTIVATE).unwrap();
+        let (_, _, id, txn) = req(f.sent.last().unwrap());
+        let refused = qmi::Builder::new(qmi::RESPONSE, txn, id).result(3).finish();
+        m.handle(&mut f, &from_modem(qrtr::TYPE_DATA, 50, 0x23, &refused));
+        assert_eq!(m.status.waiting, waiting::ERROR);
+        assert_eq!(m.call_waiting(&mut f, 9), Err(KERR_ARGUMENT));
     }
 
     #[test]

@@ -141,6 +141,14 @@ impl Platform for Hal {
         dprintln!("[modemd t={}ms] {}", time::millis(), args);
     }
 
+    fn utc_ms(&mut self) -> i64 {
+        // before the network or the RTC set the clock it reads 1970-ish: unknown (the log skips pruning)
+        match time::utc_now().0 {
+            u if u < 1_600_000_000 => 0,
+            u => u * 1000,
+        }
+    }
+
     fn fw_size(&mut self, path: &str) -> Result<usize, i32> {
         match path.strip_prefix("vendor/") {
             Some(p) => vendor_file(p, |fs, f| Ok(fs_size(fs, f))),
@@ -410,32 +418,54 @@ impl Daemon {
         );
     }
 
-    fn save_settings(&self) -> Result<(), i32> {
+    /// Replace `name` in our private directory (C:\\private\\e0003001\\) with `data`.
+    fn save_private(name: &str, data: &[u8]) -> Result<(), i32> {
         use e32::fs::{File, Fs, mode};
-        let s = self.status();
         let fs = Fs::connect()?;
         for path in ["C:\\private\\", "C:\\private\\e0003001\\"] {
-            if let Err(e) = fs.mkdir(path) {
-                if e != err::KERR_ALREADY_EXISTS {
-                    return Err(e);
-                }
+            if let Err(e) = fs.mkdir(path)
+                && e != err::KERR_ALREADY_EXISTS
+            {
+                return Err(e);
             }
         }
-        let f = File::replace(
-            &fs,
-            "C:\\private\\e0003001\\settings.bin",
-            mode::SHARE_EXCLUSIVE,
-        )?;
-        f.write(&[
-            b'C',
-            b'7',
-            1,
-            s.airplane as u8,
-            s.ring.volume,
-            s.ring.silent as u8,
-            s.ring.vibrate as u8,
-        ])?;
-        Ok(())
+        let path = alloc::format!("C:\\private\\e0003001\\{name}");
+        File::replace(&fs, &path, mode::SHARE_EXCLUSIVE)?.write(data)
+    }
+
+    /// settings.bin: the C8 record (C7's plus caller ID and the log's days); C7 files still load.
+    fn save_settings(&self) -> Result<(), i32> {
+        let s = self.status();
+        let (clir, days) = self
+            .modem
+            .as_ref()
+            .map_or((0, 30), |m| (m.clir as u8, m.log.days));
+        Self::save_private(
+            "settings.bin",
+            &[
+                b'C',
+                b'8',
+                1,
+                s.airplane as u8,
+                s.ring.volume,
+                s.ring.silent as u8,
+                s.ring.vibrate as u8,
+                clir,
+                days,
+            ],
+        )
+    }
+
+    /// calls.db, when the log changed (C8).
+    fn save_log(&mut self) {
+        let Some(m) = &mut self.modem else { return };
+        if !m.log.dirty {
+            return;
+        }
+        m.log.dirty = false;
+        if let Err(e) = Self::save_private("calls.db", &m.log.encode()) {
+            dprintln!("[modemd] calls.db not saved ({})", e);
+        }
     }
 
     fn fail(&mut self, what: &str, r: i32) {
@@ -456,6 +486,7 @@ impl Daemon {
     fn step(&mut self) -> Result<(), i32> {
         self.adsp.step();
         self.run();
+        self.save_log();
         match self.phase {
             Phase::Ipa => {
                 match ipa_firmware() {
@@ -1094,7 +1125,14 @@ impl Service for Daemon {
         );
         if !matches!(
             msg.function(),
-            op::STATUS | op::CANCEL_NOTIFY | op::RETRY | op::RING_SETTINGS | op::AIRPLANE
+            op::STATUS
+                | op::CANCEL_NOTIFY
+                | op::RETRY
+                | op::RING_SETTINGS
+                | op::AIRPLANE
+                | op::CALL_LOG
+                | op::CLEAR_LOG
+                | op::CALL_SETTINGS
         ) && !matches!(self.phase, Phase::Running)
             && !(audio_op && matches!(self.adsp, adsp::Adsp::Up))
         {
@@ -1264,6 +1302,37 @@ impl Service for Daemon {
                     0
                 }
             }
+            // the call log (C8)
+            op::CALL_LOG => match (&self.modem, msg.des_max_len(0)) {
+                (Some(m), Ok(room)) => msg
+                    .write8(0, &m.log.to_wire(room), 0)
+                    .map_or_else(|e| e, |_| 0),
+                (None, _) => NOT_READY,
+                (_, Err(e)) => e,
+            },
+            op::CLEAR_LOG => self.modem.as_mut().map_or(NOT_READY, |m| {
+                if m.log.clear(msg.int(0) as u32, msg.int(1) as u8) {
+                    m.status.log_revision = m.status.log_revision.wrapping_add(1);
+                }
+                0
+            }),
+            op::CALL_SETTINGS => {
+                let (clir, days) = (msg.int(0), msg.int(1));
+                if !(0..=2).contains(&clir) || !matches!(days, 0 | 1 | 10 | 30) {
+                    err::KERR_ARGUMENT
+                } else if let Some(m) = &mut self.modem {
+                    m.clir = clir;
+                    if m.log.set_days(days as u8, Hal.utc_ms()) {
+                        m.status.log_revision = m.status.log_revision.wrapping_add(1);
+                    }
+                    self.save_settings().err().unwrap_or(0)
+                } else {
+                    NOT_READY
+                }
+            }
+            op::CALL_WAITING => self.modem.as_mut().map_or(NOT_READY, |m| {
+                m.call_waiting(&mut Hal, msg.int(0)).err().unwrap_or(0)
+            }),
             _ => err::KERR_NOT_SUPPORTED,
         };
         if r == 0 && matches!(msg.function(), op::ANSWER | op::HANGUP) {
@@ -1346,14 +1415,36 @@ fn main() -> i32 {
             "C:\\private\\e0003001\\settings.bin",
             e32::fs::mode::READ | e32::fs::mode::SHARE_READERS_ONLY,
         ) {
-            let mut b = [0; 7];
-            if f.read_at(0, &mut b) == Ok(7) && b[..3] == [b'C', b'7', 1] && b[4] <= 10 {
+            let mut b = [0; 9];
+            let n = f.read_at(0, &mut b).unwrap_or(0);
+            let c7 = n == 7 && b[..3] == [b'C', b'7', 1];
+            let c8 = n == 9 && b[..3] == [b'C', b'8', 1] && b[7] <= 2;
+            if (c7 || c8) && b[4] <= 10 {
                 d.status.airplane = b[3] != 0;
                 d.status.ring = modem_ipc::Ring {
                     volume: b[4],
                     silent: b[5] != 0,
                     vibrate: b[6] != 0,
                 };
+            }
+            if c8 && let Some(m) = &mut d.modem {
+                m.clir = i32::from(b[7]);
+                m.log.days = b[8];
+            }
+        }
+        // the call log (C8): a missing or unreadable calls.db starts an empty one
+        if let Some(m) = &mut d.modem
+            && let Ok(f) = e32::fs::File::open(
+                &fs,
+                "C:\\private\\e0003001\\calls.db",
+                e32::fs::mode::READ | e32::fs::mode::SHARE_READERS_ONLY,
+            )
+        {
+            let mut b = vec![0u8; 10 + modem_ipc::MAX_LOG * modem_ipc::LogEntry::SIZE];
+            let n = f.read_at(0, &mut b).unwrap_or(0);
+            if let Some(mut log) = modem_proto::calllog::CallLog::decode(&b[..n]) {
+                log.days = m.log.days;
+                m.log = log;
             }
         }
     }

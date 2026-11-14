@@ -17,6 +17,14 @@ pub const MANAGE_CALLS: u16 = 0x31;
 /// a keypad tone to the far end while held (libqmi Start/Stop Continuous DTMF: TLV 1 {call id, digit} / {call id})
 pub const START_CONT_DTMF: u16 = 0x29;
 pub const STOP_CONT_DTMF: u16 = 0x2a;
+/// libqmi Set Supplementary Service: TLV 1 {action (1 activate, 2 deactivate), reason}
+pub const SET_SUPS_SERVICE: u16 = 0x33;
+/// libqmi Get Call Waiting: TLV 0x10 the service class; the reply's TLV 0x10 = the classes it is active for
+pub const GET_CALL_WAITING: u16 = 0x34;
+/// QmiVoiceSupplementaryServiceReason call waiting
+pub const REASON_CALL_WAITING: u8 = 0x0f;
+/// the voice service class (3GPP basic service group bit)
+pub const CLASS_VOICE: u8 = 0x01;
 
 /// Indication Register: call notifications (0x13) on.
 pub const INDICATIONS: [(u8, &[u8]); 1] = [(0x13, &[1])];
@@ -29,6 +37,8 @@ pub struct CallInfo {
     /// direction 2 = mobile terminated
     pub incoming: bool,
     pub number: Option<String>,
+    /// QmiVoicePresentation of the number (0 allowed, 1 restricted, 2 unavailable, 4 payphone)
+    pub presentation: u8,
 }
 
 /// TLV 0x01 = a count, then 7 bytes per call {id, state, type, direction, mode, multipart, als}; TLV 0x10 = the
@@ -54,6 +64,7 @@ pub fn all_calls(m: &Msg) -> Option<alloc::vec::Vec<CallInfo>> {
             state: c[1],
             incoming: c[3] == 2,
             number: None,
+            presentation: 0,
         });
     }
     if let Some(r) = m.tlv(0x10) {
@@ -63,6 +74,7 @@ pub fn all_calls(m: &Msg) -> Option<alloc::vec::Vec<CallInfo>> {
             let digits = r.get(at + 3..at + 3 + len)?;
             if let Some(c) = calls.iter_mut().find(|c| c.id == r[at]) {
                 c.number = core::str::from_utf8(digits).ok().map(String::from);
+                c.presentation = r[at + 1];
             }
             at += 3 + len;
         }
